@@ -404,6 +404,17 @@ class TransformerConfig(ModelParallelConfig):
     forward + cuDNN DSA backward (requires ``flash_mla`` and ``nvidia-cudnn-frontend``).
     On SM90 (Hopper), uses Triton-based fused kernels (requires ``triton>=3.0``).
     When False, falls back to unfused PyTorch implementations."""
+
+    apply_dsa_indexer_loss_fusion: bool = False
+    """If True, compute the DSA indexer KL loss with fused Triton kernels that reduce over the
+    attention/indexer head dimension inside the kernel, so the ``[b, np, sq, sk]`` and
+    ``[sq, b, index_n_heads, sk]`` fp32 intermediates are never materialized (~3GB per 'full'
+    DSA layer at seq=4096). The maths is unchanged, so loss curves stay comparable.
+
+    Independent of ``apply_dsa_kernel_fusion``: that flag fuses sparse attention and requires the
+    absorbed MLA layout, whereas this one applies to plain ``dsa`` as well. Requires SM90+ and
+    ``triton>=3.0``, and only supports the dense indexer loss
+    (``dsa_indexer_use_sparse_loss=False``)."""
     ##### FlagScale End #####
 
     ####################
@@ -1302,7 +1313,11 @@ class TransformerConfig(ModelParallelConfig):
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
         elif self.experimental_attention_variant == "dsa":
-            pass
+            ##### FlagScale Begin #####
+            # The indexer is identical across DSA variants, so this applies to plain "dsa".
+            if self.apply_dsa_indexer_loss_fusion:
+                self._validate_dsa_indexer_loss_fusion()
+            ##### FlagScale End #####
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
@@ -2605,6 +2620,32 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
+
+    ##### FlagScale Begin #####
+    def _validate_dsa_indexer_loss_fusion(self) -> None:
+        """Check the fused Triton indexer-loss kernels can run on this setup."""
+        assert (
+            torch.cuda.is_available()
+        ), "apply_dsa_indexer_loss_fusion requires a CUDA device, but none is available."
+        sm = torch.cuda.get_device_capability()
+        assert sm[0] >= 9, (
+            f"apply_dsa_indexer_loss_fusion requires SM90+ (Hopper or later), "
+            f"but current device has compute capability {sm[0]}.{sm[1]}."
+        )
+        try:
+            import triton  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "apply_dsa_indexer_loss_fusion requires Triton for the fused indexer-loss "
+                "kernels. Install triton>=3.0 or set apply_dsa_indexer_loss_fusion=False."
+            ) from e
+        if self.dsa_indexer_use_sparse_loss:
+            raise ValueError(
+                "apply_dsa_indexer_loss_fusion currently implements only the dense indexer "
+                "loss, but dsa_indexer_use_sparse_loss=True. Set one of them to False."
+            )
+
+    ##### FlagScale End #####
 
 
 @dataclass
