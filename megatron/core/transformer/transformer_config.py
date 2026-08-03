@@ -426,16 +426,16 @@ class TransformerConfig(ModelParallelConfig):
     On SM90 (Hopper), uses Triton-based fused kernels (requires ``triton>=3.0``).
     When False, falls back to unfused PyTorch implementations."""
 
-    apply_dsa_indexer_loss_fusion: bool = False
-    """If True, compute the DSA indexer KL loss with fused Triton kernels that reduce over the
-    attention/indexer head dimension inside the kernel, so the ``[b, np, sq, sk]`` and
+    apply_dsa_indexer_loss_fusion: bool = True
+    """If True (default), compute the DSA indexer KL loss with fused Triton kernels that reduce over
+    the attention/indexer head dimension inside the kernel, so the ``[b, np, sq, sk]`` and
     ``[sq, b, index_n_heads, sk]`` fp32 intermediates are never materialized (~3GB per 'full'
     DSA layer at seq=4096). The maths is unchanged, so loss curves stay comparable.
 
     Independent of ``apply_dsa_kernel_fusion``: that flag fuses sparse attention and requires the
-    absorbed MLA layout, whereas this one applies to plain ``dsa`` as well. Requires SM90+ and
-    ``triton>=3.0``, and only supports the dense indexer loss
-    (``dsa_indexer_use_sparse_loss=False``)."""
+    absorbed MLA layout, whereas this one applies to plain ``dsa`` as well. Needs SM90+,
+    ``triton>=3.0`` and the dense indexer loss; on any other setup it automatically falls back to
+    the unfused path (disable explicitly with ``--no-dsa-indexer-loss-fusion``)."""
     ##### FlagScale End #####
 
     ####################
@@ -2745,27 +2745,35 @@ class TransformerConfig(ModelParallelConfig):
         return result
 
     def _validate_dsa_indexer_loss_fusion(self) -> None:
-        """Check the fused Triton indexer-loss kernels can run on this setup."""
-        assert (
-            torch.cuda.is_available()
-        ), "apply_dsa_indexer_loss_fusion requires a CUDA device, but none is available."
-        sm = torch.cuda.get_device_capability()
-        assert sm[0] >= 9, (
-            f"apply_dsa_indexer_loss_fusion requires SM90+ (Hopper or later), "
-            f"but current device has compute capability {sm[0]}.{sm[1]}."
-        )
-        try:
-            import triton  # noqa: F401
-        except ImportError as e:
-            raise ImportError(
-                "apply_dsa_indexer_loss_fusion requires Triton for the fused indexer-loss "
-                "kernels. Install triton>=3.0 or set apply_dsa_indexer_loss_fusion=False."
-            ) from e
-        if self.dsa_indexer_use_sparse_loss:
-            raise ValueError(
-                "apply_dsa_indexer_loss_fusion currently implements only the dense indexer "
-                "loss, but dsa_indexer_use_sparse_loss=True. Set one of them to False."
+        """Downgrade to the unfused indexer loss when this setup can't run the fusion.
+
+        The fused Triton kernels are an optimisation with an exact unfused fallback, so an
+        unsupported environment (no CUDA / pre-SM90 / no Triton) or the unimplemented sparse-loss
+        variant disables the fusion with a warning rather than failing the run. Pass
+        ``--no-dsa-indexer-loss-fusion`` to opt out explicitly.
+        """
+        import warnings
+
+        reason = None
+        if not torch.cuda.is_available():
+            reason = "no CUDA device is available"
+        elif torch.cuda.get_device_capability()[0] < 9:
+            sm = torch.cuda.get_device_capability()
+            reason = f"device compute capability {sm[0]}.{sm[1]} is below SM90"
+        elif self.dsa_indexer_use_sparse_loss:
+            reason = "it implements only the dense indexer loss (dsa_indexer_use_sparse_loss=True)"
+        else:
+            try:
+                import triton  # noqa: F401
+            except ImportError:
+                reason = "Triton is not installed (needs triton>=3.0)"
+
+        if reason is not None:
+            warnings.warn(
+                f"Disabling apply_dsa_indexer_loss_fusion because {reason}; "
+                "falling back to the unfused DSA indexer loss."
             )
+            self.apply_dsa_indexer_loss_fusion = False
 
     ##### FlagScale End #####
 
