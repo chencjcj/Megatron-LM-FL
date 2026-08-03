@@ -3271,14 +3271,6 @@ def _add_experimental_attention_variant_args(parser):
             'The list length must equal num_layers.'
     )
     group.add_argument(
-        '--dsa-kernel-fusion',
-        action='store_true',
-        default=False,
-        help='Enable fused DSA sparse-attention kernels (SM90 Triton, or FlashMLA + cuDNN '
-        'DSA on SM100+). Requires --experimental-attention-variant dsa_absorbed.',
-        dest='apply_dsa_kernel_fusion',
-    )
-    group.add_argument(
         '--no-dsa-kernel-fusion',
         action='store_false',
         help='Disable fused DSA sparse-attention kernels (FlashMLA + cuDNN DSA) '
@@ -3286,12 +3278,10 @@ def _add_experimental_attention_variant_args(parser):
         dest='apply_dsa_kernel_fusion',
     )
     group.add_argument(
-        '--dsa-indexer-loss-fusion',
-        action='store_true',
-        default=False,
-        help='Compute the DSA indexer KL loss with fused Triton kernels that reduce over the '
-        'head dimension inside the kernel, avoiding the [b, np, sq, sk] fp32 intermediates. '
-        'Requires SM90+ and triton>=3.0; dense indexer loss only. Maths is unchanged.',
+        '--no-dsa-indexer-loss-fusion',
+        action='store_false',
+        help='Disable the fused Triton DSA indexer-loss kernels and fall back to the '
+        'unfused PyTorch implementation.',
         dest='apply_dsa_indexer_loss_fusion',
     )
     return parser
