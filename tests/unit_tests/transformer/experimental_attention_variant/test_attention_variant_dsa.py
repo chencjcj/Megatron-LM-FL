@@ -1731,3 +1731,173 @@ class TestDSAModuleSpecDispatch:
         config = self._make_dsa_config(qk_l2_norm=True)
         with pytest.raises(AssertionError, match="qk_l2_norm is not supported"):
             get_dsa_module_spec_for_backend(config, backend=None)
+
+
+class TestDSAttentionTHD:
+    """End-to-end THD (packed variable-length) parity for DSAttention.
+
+    A packed sequence of several documents must produce, per document, the same
+    output as running that document on its own — i.e. attention never crosses a
+    document boundary and RoPE positions restart at each boundary.
+    """
+
+    DOC_SEQLENS = [12, 8, 6]  # last doc (6) is shorter than index_topk (8)
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+
+        cls = request.cls
+        cls.config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=16,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=64,
+            rope_type='rope',
+            rotary_base=10000,
+            rotary_percent=1.0,
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=8,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=False,
+        )
+
+        from megatron.core.extensions.transformer_engine import TELinear, TENorm
+        from megatron.core.transformer.spec_utils import ModuleSpec
+
+        indexer_submodules = DSAIndexerSubmodules(
+            linear_wq_b=ModuleSpec(module=TELinear),
+            linear_wk=ModuleSpec(module=TELinear),
+            k_norm=ModuleSpec(module=TENorm),
+            linear_weights_proj=ModuleSpec(module=TELinear),
+        )
+        indexer_spec = ModuleSpec(module=DSAIndexer, submodules=indexer_submodules)
+        submodules = DSAttentionSubmodules(indexer=indexer_spec)
+
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        cls.sparse_attention = DSAttention(
+            config=cls.config,
+            submodules=submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            pg_collection=cls.pg_collection,
+        ).cuda()
+
+        yield
+        Utils.destroy_model_parallel()
+
+    def _make_packed_seq_params(self, device):
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        cu = [0]
+        for length in self.DOC_SEQLENS:
+            cu.append(cu[-1] + length)
+        cu_seqlens = torch.tensor(cu, dtype=torch.int32, device=device)
+        max_len = max(self.DOC_SEQLENS)
+        return PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max_len,
+            max_seqlen_kv=max_len,
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_output_matches_per_document(self):
+        """Packed forward == per-document forward, position by position (eval)."""
+        self.sparse_attention.eval()
+        sq = sum(self.DOC_SEQLENS)
+        b = 1
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_heads
+
+        torch.manual_seed(7)
+        query = torch.randn(sq, b, num_heads, head_dim, dtype=torch.bfloat16).cuda()
+        key = torch.randn(sq, b, num_heads, head_dim, dtype=torch.bfloat16).cuda()
+        value = torch.randn(sq, b, num_heads, head_dim, dtype=torch.bfloat16).cuda()
+        x = torch.randn(sq, b, self.config.hidden_size, dtype=torch.bfloat16).cuda()
+        qr = torch.randn(sq, b, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
+
+        # --- Packed (THD) forward over the whole concatenated sequence ---
+        packed_seq_params = self._make_packed_seq_params(x.device)
+        with torch.no_grad():
+            out_packed = self.sparse_attention(
+                query=query, key=key, value=value, x=x, qr=qr,
+                attention_mask=None, attn_mask_type=AttnMaskType.causal,
+                packed_seq_params=packed_seq_params,
+            )
+
+        # --- Reference: each document on its own (plain causal, no packing) ---
+        cu = [0]
+        for length in self.DOC_SEQLENS:
+            cu.append(cu[-1] + length)
+        outs = []
+        with torch.no_grad():
+            for s, e in zip(cu[:-1], cu[1:]):
+                L = e - s
+                attn_mask = torch.tril(
+                    torch.ones(b, 1, L, L, dtype=torch.bool, device=x.device)
+                )
+                out_doc = self.sparse_attention(
+                    query=query[s:e], key=key[s:e], value=value[s:e],
+                    x=x[s:e], qr=qr[s:e],
+                    attention_mask=attn_mask, attn_mask_type=AttnMaskType.causal,
+                )
+                outs.append(out_doc)
+        out_ref = torch.cat(outs, dim=0)
+
+        assert out_packed.shape == out_ref.shape
+        assert torch.isfinite(out_packed).all(), "packed output has NaN/Inf"
+        of, rf = out_packed.float(), out_ref.float()
+        cos = torch.nn.functional.cosine_similarity(
+            of.reshape(1, -1), rf.reshape(1, -1)
+        ).item()
+        max_diff = (of - rf).abs().max().item()
+        assert cos > 0.999, f"THD vs per-doc cos_sim={cos} (max_diff={max_diff})"
+        assert torch.allclose(of, rf, rtol=1e-2, atol=2e-2), f"max_diff={max_diff}"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_training_forward_backward_finite(self):
+        """Training path (indexer loss + AutoScaler) runs under THD and stays finite."""
+        self.sparse_attention.train()
+        sq = sum(self.DOC_SEQLENS)
+        b = 1
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_heads
+
+        torch.manual_seed(11)
+        query = torch.randn(
+            sq, b, num_heads, head_dim, dtype=torch.bfloat16
+        ).cuda().requires_grad_(True)
+        key = torch.randn(
+            sq, b, num_heads, head_dim, dtype=torch.bfloat16
+        ).cuda().requires_grad_(True)
+        value = torch.randn(
+            sq, b, num_heads, head_dim, dtype=torch.bfloat16
+        ).cuda().requires_grad_(True)
+        x = torch.randn(sq, b, self.config.hidden_size, dtype=torch.bfloat16).cuda()
+        qr = torch.randn(sq, b, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
+
+        out = self.sparse_attention(
+            query=query, key=key, value=value, x=x, qr=qr,
+            attention_mask=None, attn_mask_type=AttnMaskType.causal,
+            packed_seq_params=self._make_packed_seq_params(x.device),
+        )
+        assert torch.isfinite(out).all(), "THD training output has NaN/Inf"
+        out.sum().backward()
+        for name, g in (("query", query.grad), ("key", key.grad), ("value", value.grad)):
+            assert g is not None and torch.isfinite(g.float()).all(), f"{name} grad bad"
+

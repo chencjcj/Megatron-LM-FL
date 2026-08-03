@@ -55,6 +55,28 @@ def _causal_mask(sq: int, sk: int, device: torch.device) -> Tensor:
     )
 
 
+def cu_seqlens_to_bounds(
+    cu_seqlens: Tensor, sq: int, device: torch.device
+) -> Tuple[Tensor, Tensor]:
+    """Per-query ``[start, end)`` KV bounds for a THD-packed sequence.
+
+    ``cu_seqlens`` is the ``[num_docs + 1]`` cumulative document-length prefix
+    (e.g. ``[0, 5, 12]`` = two docs of length 5 and 7). Query position ``i`` sees
+    KV positions ``[start, end)`` where ``start`` is the first token of ``i``'s
+    document and ``end = i + 1`` (causal within the document). Regular causal is
+    the single-document special case ``start=0, end=i+1``. Mirrors the bounds
+    form used by NVIDIA/Megatron-LM ``dsa_masking.py``.
+
+    Returns two ``[sq]`` int32 tensors ``(q_start, q_end)``.
+    """
+    positions = torch.arange(sq, device=device, dtype=torch.int64)
+    cs = cu_seqlens.to(device=device, dtype=torch.int64)
+    doc = torch.searchsorted(cs[1:], positions, right=True)
+    q_start = cs[doc].to(torch.int32)
+    q_end = (positions + 1).to(torch.int32)
+    return q_start.contiguous(), q_end.contiguous()
+
+
 # ---------------------------------------------------------------------------
 # Block-size selection
 # ---------------------------------------------------------------------------
@@ -84,13 +106,16 @@ def _select_blocks(head_dim_padded: int) -> Tuple[int, int, int]:
 @triton.jit
 def _index_score_kernel(
     Q_ptr, K_ptr, W_ptr, OUT_ptr,
+    QS_ptr, QE_ptr,
     SQ, SK, H,
     stride_q_s, stride_q_b, stride_q_h, stride_q_d,
     stride_k_s, stride_k_b, stride_k_d,
     stride_w_s, stride_w_b, stride_w_h,
     stride_o_b, stride_o_s, stride_o_k,
+    stride_qs, stride_qe,
     D: tl.constexpr,
     D_PAD: tl.constexpr,
+    HAS_BOUNDS: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -103,6 +128,10 @@ def _index_score_kernel(
 
     ``k`` is single-head and therefore shared by all indexer heads, so its tile
     is loaded once outside the head loop.
+
+    When ``HAS_BOUNDS`` (THD packing), positions outside each query's
+    ``[q_start, q_end)`` window are set to ``-inf`` so top-k and the softmax
+    never cross a document boundary.
     """
     pid_b = tl.program_id(0)
     pid_q = tl.program_id(1)
@@ -145,6 +174,12 @@ def _index_score_kernel(
         ).to(tl.float32)
         acc += scores * w[:, None]
 
+    if HAS_BOUNDS:
+        q_start = tl.load(QS_ptr + offs_q * stride_qs, mask=mask_q, other=0)
+        q_end = tl.load(QE_ptr + offs_q * stride_qe, mask=mask_q, other=SK)
+        in_bounds = (offs_k[None, :] >= q_start[:, None]) & (offs_k[None, :] < q_end[:, None])
+        acc = tl.where(in_bounds, acc, float("-inf"))
+
     tl.store(
         OUT_ptr + pid_b * stride_o_b + offs_q[:, None] * stride_o_s
         + offs_k[None, :] * stride_o_k,
@@ -161,15 +196,18 @@ def _index_score_kernel(
 @triton.jit
 def _attn_lse_kernel(
     Q_ptr, K_ptr, M_ptr, LSE_ptr,
+    QS_ptr, QE_ptr,
     SQ, SK,
     softmax_scale,
     stride_q_s, stride_q_b, stride_q_h, stride_q_d,
     stride_k_s, stride_k_b, stride_k_h, stride_k_d,
     stride_m_b, stride_m_s, stride_m_k,
     stride_l_b, stride_l_h, stride_l_s,
+    stride_qs, stride_qe,
     D: tl.constexpr,
     D_PAD: tl.constexpr,
     HAS_MASK: tl.constexpr,
+    HAS_BOUNDS: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -203,6 +241,10 @@ def _attn_lse_kernel(
     run_max = tl.full([BLOCK_Q], float("-inf"), dtype=tl.float32)
     run_sum = tl.zeros([BLOCK_Q], dtype=tl.float32)
 
+    if HAS_BOUNDS:
+        q_start = tl.load(QS_ptr + offs_q * stride_qs, mask=mask_q, other=0)
+        q_end = tl.load(QE_ptr + offs_q * stride_qe, mask=mask_q, other=SK)
+
     for kt in range(0, SK, BLOCK_K):
         offs_k = kt + tl.arange(0, BLOCK_K)
         mask_k = offs_k < SK
@@ -221,6 +263,9 @@ def _attn_lse_kernel(
                 other=float("-inf"),
             )
             scores = scores + m_tile
+        if HAS_BOUNDS:
+            in_bounds = (offs_k[None, :] >= q_start[:, None]) & (offs_k[None, :] < q_end[:, None])
+            scores = tl.where(in_bounds, scores, float("-inf"))
         scores = tl.where(mask_k[None, :], scores, float("-inf"))
 
         new_max = tl.maximum(run_max, tl.max(scores, axis=1))
@@ -248,6 +293,7 @@ def _attn_lse_kernel(
 @triton.jit
 def _attn_head_sum_kernel(
     Q_ptr, K_ptr, M_ptr, LSE_ptr, OUT_ptr,
+    QS_ptr, QE_ptr,
     SQ, SK, NP,
     softmax_scale,
     stride_q_s, stride_q_b, stride_q_h, stride_q_d,
@@ -255,9 +301,11 @@ def _attn_head_sum_kernel(
     stride_m_b, stride_m_s, stride_m_k,
     stride_l_b, stride_l_h, stride_l_s,
     stride_o_b, stride_o_s, stride_o_k,
+    stride_qs, stride_qe,
     D: tl.constexpr,
     D_PAD: tl.constexpr,
     HAS_MASK: tl.constexpr,
+    HAS_BOUNDS: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -286,6 +334,10 @@ def _attn_head_sum_kernel(
             mask=mask_q[:, None] & mask_k[None, :],
             other=float("-inf"),
         )
+    if HAS_BOUNDS:
+        q_start = tl.load(QS_ptr + offs_q * stride_qs, mask=mask_q, other=0)
+        q_end = tl.load(QE_ptr + offs_q * stride_qe, mask=mask_q, other=SK)
+        in_bounds = (offs_k[None, :] >= q_start[:, None]) & (offs_k[None, :] < q_end[:, None])
 
     acc = tl.zeros([BLOCK_Q, BLOCK_K], dtype=tl.float32)
 
@@ -305,6 +357,8 @@ def _attn_head_sum_kernel(
         scores = tl.dot(q_tile, tl.trans(k_tile)) * softmax_scale
         if HAS_MASK:
             scores = scores + m_tile
+        if HAS_BOUNDS:
+            scores = tl.where(in_bounds, scores, float("-inf"))
         lse = tl.load(
             LSE_ptr + pid_b * stride_l_b + h * stride_l_h + offs_q * stride_l_s,
             mask=mask_q,
@@ -513,13 +567,22 @@ def _mask_strides(mask: Optional[Tensor], b: int) -> Tuple[int, int, int]:
     return batch_stride, mask.stride(1), mask.stride(2)
 
 
-def indexer_index_score(q: Tensor, k: Tensor, weights: Tensor) -> Tensor:
+def indexer_index_score(
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    q_start: Optional[Tensor] = None,
+    q_end: Optional[Tensor] = None,
+) -> Tensor:
     """Head-reduced indexer scores, without any mask applied.
 
     Args:
         q: ``[sq, b, index_n_heads, d]`` indexer queries.
         k: ``[sk, b, d]`` indexer keys (single head, shared across heads).
         weights: ``[sq, b, index_n_heads]`` per-head weights, already scaled.
+        q_start, q_end: optional ``[sq]`` int32 THD bounds (see
+            :func:`cu_seqlens_to_bounds`); positions outside ``[start, end)`` are
+            set to ``-inf``.
 
     Returns:
         ``[b, sq, sk]`` fp32 — equivalent to ``dsa._compute_index_scores``.
@@ -528,17 +591,24 @@ def indexer_index_score(q: Tensor, k: Tensor, weights: Tensor) -> Tensor:
     sk = k.shape[0]
     d_pad = _next_pow2(d)
     block_q, block_k, num_warps = _select_blocks(d_pad)
+    has_bounds = q_start is not None
+    qs_arg = q_start if has_bounds else q  # unused pointer when HAS_BOUNDS=False
+    qe_arg = q_end if has_bounds else q
+    qs_stride = q_start.stride(0) if has_bounds else 0
+    qe_stride = q_end.stride(0) if has_bounds else 0
 
     out = torch.empty((b, sq, sk), dtype=torch.float32, device=q.device)
     grid = (b, triton.cdiv(sq, block_q), triton.cdiv(sk, block_k))
     _index_score_kernel[grid](
         q, k, weights, out,
+        qs_arg, qe_arg,
         sq, sk, h,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2),
         weights.stride(0), weights.stride(1), weights.stride(2),
         out.stride(0), out.stride(1), out.stride(2),
-        D=d, D_PAD=d_pad,
+        qs_stride, qe_stride,
+        D=d, D_PAD=d_pad, HAS_BOUNDS=has_bounds,
         BLOCK_Q=block_q, BLOCK_K=block_k,
         num_warps=num_warps,
     )
@@ -550,6 +620,8 @@ def attn_head_sum(
     key: Tensor,
     softmax_scale: float,
     mask: Optional[Tensor],
+    q_start: Optional[Tensor] = None,
+    q_end: Optional[Tensor] = None,
 ) -> Tensor:
     """Head-summed attention softmax probabilities.
 
@@ -558,6 +630,8 @@ def attn_head_sum(
         key: ``[sk, b, np, hn]`` attention keys.
         softmax_scale: scale applied to ``q . k``.
         mask: additive ``-inf``/``0`` mask, ``[sq, sk]`` or ``[b, sq, sk]``.
+        q_start, q_end: optional ``[sq]`` int32 THD bounds; mutually exclusive
+            with ``mask``.
 
     Returns:
         ``[b, sq, sk]`` fp32 — equivalent to
@@ -569,19 +643,27 @@ def attn_head_sum(
     d_pad = _next_pow2(hn)
     block_q, block_k, num_warps = _select_blocks(d_pad)
     has_mask = mask is not None
+    has_bounds = q_start is not None
+    assert not (has_mask and has_bounds), "mask and THD bounds are mutually exclusive"
     sm_b, sm_s, sm_k = _mask_strides(mask, b)
     mask_arg = mask if has_mask else query  # unused pointer when HAS_MASK=False
+    qs_arg = q_start if has_bounds else query
+    qe_arg = q_end if has_bounds else query
+    qs_stride = q_start.stride(0) if has_bounds else 0
+    qe_stride = q_end.stride(0) if has_bounds else 0
 
     lse = torch.empty((b, np_, sq), dtype=torch.float32, device=query.device)
     _attn_lse_kernel[(b, np_, triton.cdiv(sq, block_q))](
         query, key, mask_arg, lse,
+        qs_arg, qe_arg,
         sq, sk,
         softmax_scale,
         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
         key.stride(0), key.stride(1), key.stride(2), key.stride(3),
         sm_b, sm_s, sm_k,
         lse.stride(0), lse.stride(1), lse.stride(2),
-        D=hn, D_PAD=d_pad, HAS_MASK=has_mask,
+        qs_stride, qe_stride,
+        D=hn, D_PAD=d_pad, HAS_MASK=has_mask, HAS_BOUNDS=has_bounds,
         BLOCK_Q=block_q, BLOCK_K=block_k,
         num_warps=num_warps,
     )
@@ -589,6 +671,7 @@ def attn_head_sum(
     head_sum = torch.empty((b, sq, sk), dtype=torch.float32, device=query.device)
     _attn_head_sum_kernel[(b, triton.cdiv(sq, block_q), triton.cdiv(sk, block_k))](
         query, key, mask_arg, lse, head_sum,
+        qs_arg, qe_arg,
         sq, sk, np_,
         softmax_scale,
         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
@@ -596,7 +679,8 @@ def attn_head_sum(
         sm_b, sm_s, sm_k,
         lse.stride(0), lse.stride(1), lse.stride(2),
         head_sum.stride(0), head_sum.stride(1), head_sum.stride(2),
-        D=hn, D_PAD=d_pad, HAS_MASK=has_mask,
+        qs_stride, qe_stride,
+        D=hn, D_PAD=d_pad, HAS_MASK=has_mask, HAS_BOUNDS=has_bounds,
         BLOCK_Q=block_q, BLOCK_K=block_k,
         num_warps=num_warps,
     )
@@ -689,6 +773,19 @@ def _row_masks(mask: Tensor, b: int) -> Tuple[Tensor, Tensor]:
     return row_valid, causal_valid
 
 
+def _bounds_to_valid(q_start: Tensor, q_end: Tensor, sk: int) -> Tuple[Tensor, Tensor]:
+    """Return ``(row_valid, causal_valid)`` for per-query ``[start, end)`` bounds.
+
+    The THD analogue of :func:`_row_masks`: ``causal_valid[0, s, t]`` is True when
+    ``q_start[s] <= t < q_end[s]``. Built vectorised, ``[1, sq, sk]``.
+    """
+    ks = torch.arange(sk, device=q_start.device)
+    causal_valid = (ks[None, :] >= q_start[:, None]) & (ks[None, :] < q_end[:, None])
+    causal_valid = causal_valid.unsqueeze(0)
+    row_valid = causal_valid.any(dim=-1, keepdim=True)
+    return row_valid, causal_valid
+
+
 def _target_and_predict(
     index_score: Tensor,
     head_sum: Tensor,
@@ -735,6 +832,7 @@ def fwd_indexer_loss_triton(
     mask: Optional[Tensor],
     pg_collection,
     calculate_per_token_loss: bool,
+    cu_seqlens: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Triton counterpart of ``dsa.fwd_fused_indexer_loss_naive`` (dense only).
 
@@ -750,20 +848,30 @@ def fwd_indexer_loss_triton(
     this -- it masks both -- so :func:`bwd_indexer_loss_triton` mirrors that
     instead. ``DSAttention`` always passes a real mask, so neither quirk is
     reachable in training.
+
+    ``cu_seqlens`` selects the THD (packed variable-length) path: masking is done
+    by per-query ``[start, end)`` document bounds inside the kernels instead of a
+    dense mask (``mask`` must be ``None``).
     """
     sq, b, _, _ = q.shape
     sk = k.shape[0]
-    # Attention always gets a causal mask; the index scores only get one if the
-    # caller supplied it (see docstring).
-    attn_mask = _causal_mask(sq, sk, q.device) if mask is None else mask
+    if cu_seqlens is not None:
+        assert mask is None, "cu_seqlens (THD) and mask are mutually exclusive"
+        q_start, q_end = cu_seqlens_to_bounds(cu_seqlens, sq, q.device)
+        index_score = indexer_index_score(q, k, weights, q_start, q_end)
+        row_valid, _ = _bounds_to_valid(q_start, q_end, sk)
+        head_sum = attn_head_sum(query, key, softmax_scale, None, q_start, q_end)
+    else:
+        # Attention always gets a causal mask; the index scores only get one if
+        # the caller supplied it (see docstring).
+        attn_mask = _causal_mask(sq, sk, q.device) if mask is None else mask
+        index_score = indexer_index_score(q, k, weights)
+        if mask is not None:
+            index_score = index_score + mask
+        row_valid, _ = _row_masks(attn_mask, b)
+        head_sum = attn_head_sum(query, key, softmax_scale, attn_mask)
 
-    index_score = indexer_index_score(q, k, weights)
-    if mask is not None:
-        index_score = index_score + mask
     topk_indices = index_score.topk(min(topk, sq), dim=-1)[1]
-
-    row_valid, _ = _row_masks(attn_mask, b)
-    head_sum = attn_head_sum(query, key, softmax_scale, attn_mask)
     target, predict = _target_and_predict(index_score, head_sum, row_valid, pg_collection)
 
     kl_per_row = (
@@ -785,25 +893,34 @@ def bwd_indexer_loss_triton(
     pg_collection,
     mask: Optional[Tensor],
     calculate_per_token_loss: bool,
+    cu_seqlens: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Triton counterpart of ``dsa.bwd_fused_indexer_loss_naive`` (dense only).
 
     Recomputes the two head-dimension reductions rather than saving them, and
-    returns ``(grad_q, grad_weights, grad_k)``.
+    returns ``(grad_q, grad_weights, grad_k)``. ``cu_seqlens`` selects the THD
+    path (``mask`` must be ``None``); gradients then never cross a document
+    boundary because ``grad_index_score`` is gated by the bounds' ``causal_valid``.
     """
     sq, b, _, _ = q.shape
     sk = k.shape[0]
-    # The reference is asymmetric between its own passes, and this mirrors it:
-    # forward reaches the index scores through fused_qk_topk_naive, which only adds a
-    # mask when one is given, whereas bwd_fused_indexer_loss_naive adds the causal mask
-    # to *both* attention and index scores unconditionally. DSAttention always supplies
-    # a mask, so the difference only surfaces in direct unit tests.
-    attn_mask = _causal_mask(sq, sk, q.device) if mask is None else mask
+    if cu_seqlens is not None:
+        assert mask is None, "cu_seqlens (THD) and mask are mutually exclusive"
+        q_start, q_end = cu_seqlens_to_bounds(cu_seqlens, sq, q.device)
+        index_score = indexer_index_score(q, k, weights, q_start, q_end)
+        row_valid, causal_valid = _bounds_to_valid(q_start, q_end, sk)
+        head_sum = attn_head_sum(query, key, softmax_scale, None, q_start, q_end)
+    else:
+        # The reference is asymmetric between its own passes, and this mirrors it:
+        # forward reaches the index scores through fused_qk_topk_naive, which only adds a
+        # mask when one is given, whereas bwd_fused_indexer_loss_naive adds the causal mask
+        # to *both* attention and index scores unconditionally. DSAttention always supplies
+        # a mask, so the difference only surfaces in direct unit tests.
+        attn_mask = _causal_mask(sq, sk, q.device) if mask is None else mask
+        index_score = indexer_index_score(q, k, weights) + attn_mask
+        row_valid, causal_valid = _row_masks(attn_mask, b)
+        head_sum = attn_head_sum(query, key, softmax_scale, attn_mask)
 
-    index_score = indexer_index_score(q, k, weights) + attn_mask
-
-    row_valid, causal_valid = _row_masks(attn_mask, b)
-    head_sum = attn_head_sum(query, key, softmax_scale, attn_mask)
     target, predict = _target_and_predict(index_score, head_sum, row_valid, pg_collection)
 
     # d(loss)/d(kl_per_element), constant across the [b, sq, sk] grid.
@@ -824,6 +941,7 @@ def bwd_indexer_loss_triton(
 __all__ = [
     "attn_head_sum",
     "bwd_indexer_loss_triton",
+    "cu_seqlens_to_bounds",
     "fwd_indexer_loss_triton",
     "indexer_index_score",
     "indexer_index_score_backward",

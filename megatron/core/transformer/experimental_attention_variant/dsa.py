@@ -1025,8 +1025,12 @@ class DSAIndexer(MegatronModule):
             parallel_mode="duplicated",
         )
 
-    def _apply_rope(self, x: torch.Tensor, rotary_pos_emb: torch.Tensor, mscale: float):
-        """Apply RoPE to the input tensor."""
+    def _apply_rope(self, x: torch.Tensor, rotary_pos_emb: torch.Tensor, mscale: float,
+                    cu_seqlens: Optional[torch.Tensor] = None):
+        """Apply RoPE to the input tensor.
+
+        ``cu_seqlens`` (THD) makes RoPE positions restart at each document boundary.
+        """
         # x_pe   [seqlen, batch, *, qk_pos_emb_head_dim]
         # x_nope [seqlen, batch, *, index_head_dim - qk_pos_emb_head_dim]
         # To align with DeepSeek's implementation,
@@ -1034,17 +1038,32 @@ class DSAIndexer(MegatronModule):
         x_pe, x_nope = torch.split(
             x, [self.qk_pos_emb_head_dim, self.index_head_dim - self.qk_pos_emb_head_dim], dim=-1
         )
-        x_pe = apply_rotary_pos_emb(
-            x_pe,
-            rotary_pos_emb,
-            config=self.config,
-            cu_seqlens=None,
-            mscale=mscale,
-            cp_group=self.pg_collection.cp,
-            # This flag is for the MLA-style interleaving in RoPE.
-            # Set it to False, as indexer does not apply interleaved RoPE.
-            mla_rotary_interleaved=False,
-        )
+        if cu_seqlens is not None:
+            # The THD rotary path expects a packed ``[t, h, d]`` tensor (no batch dim)
+            # and adds one internally. The indexer keeps ``[s, b, h, d]`` with b=1 under
+            # packing, so fold the batch dim for the rotary call and restore it after.
+            s, bsz, h, dpe = x_pe.shape
+            x_pe = apply_rotary_pos_emb(
+                x_pe.reshape(s * bsz, h, dpe),
+                rotary_pos_emb,
+                config=self.config,
+                cu_seqlens=cu_seqlens,
+                mscale=mscale,
+                cp_group=self.pg_collection.cp,
+                mla_rotary_interleaved=False,
+            ).reshape(s, bsz, h, dpe)
+        else:
+            x_pe = apply_rotary_pos_emb(
+                x_pe,
+                rotary_pos_emb,
+                config=self.config,
+                cu_seqlens=None,
+                mscale=mscale,
+                cp_group=self.pg_collection.cp,
+                # This flag is for the MLA-style interleaving in RoPE.
+                # Set it to False, as indexer does not apply interleaved RoPE.
+                mla_rotary_interleaved=False,
+            )
         # [seqlen, batch, *, index_head_dim]
         x = torch.cat([x_pe, x_nope], dim=-1)
         return x
@@ -1059,11 +1078,22 @@ class DSAIndexer(MegatronModule):
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
             None, None, x, self.config, packed_seq_params
         )
+        packed_seq = (
+            packed_seq_params is not None
+            and getattr(packed_seq_params, "qkv_format", None) == "thd"
+        )
+        cu_seqlens_q = None
+        if packed_seq:
+            cu_seqlens_q = (
+                packed_seq_params.cu_seqlens_q_padded
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else packed_seq_params.cu_seqlens_q
+            )
         if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
             mscale = 1.0
         else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
 
         # =========================================
         # Gather inputs if sp is enabled
@@ -1085,7 +1115,7 @@ class DSAIndexer(MegatronModule):
         # [seqlen, batch, index_n_heads * index_head_dim]
         #   -> [seqlen, batch, index_n_heads, index_head_dim]
         q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
-        q = self._apply_rope(q, rotary_pos_emb, mscale)
+        q = self._apply_rope(q, rotary_pos_emb, mscale, cu_seqlens_q)
 
         # =========================================
         # k linear and apply rope to k
@@ -1095,7 +1125,7 @@ class DSAIndexer(MegatronModule):
         k = self.k_norm(k)
         # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
         k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
-        k = self._apply_rope(k, rotary_pos_emb, mscale)
+        k = self._apply_rope(k, rotary_pos_emb, mscale, cu_seqlens_q)
         # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
         k = k.reshape(seqlen, bsz, self.index_head_dim)
 
@@ -1136,8 +1166,6 @@ class DSAIndexer(MegatronModule):
             index_scores: Index scores [batch, seqlen, seqlen].
             topk_indices: Top-k indices [batch, seqlen, index_topk].
         """
-        assert packed_seq_params is None, "Packed sequence is not supported for DSAttention"
-
         # [seqlen, batch, index_n_heads * index_head_dim]
         # [seqlen, batch, index_head_dim]
         # [seqlen, batch, index_n_heads]
@@ -1171,9 +1199,31 @@ class DSAIndexer(MegatronModule):
         return topk_indices
 
 
-def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
+def _block_diag_causal_mask(cu_seqlens, sq, sk, device):
+    """``[sq, sk]`` additive causal mask restricted to each document (THD).
+
+    A packed query at absolute position ``i`` may attend to key ``t`` iff ``t`` is in
+    the same document (``t >= doc_start``) and causal (``t <= i``). ``cu_seqlens`` is
+    the ``[num_docs + 1]`` cumulative document-length prefix.
+    """
+    cs = cu_seqlens.to(device=device, dtype=torch.int64)
+    pos = torch.arange(sq, device=device, dtype=torch.int64)
+    doc_start = cs[torch.searchsorted(cs[1:], pos, right=True)]
+    ks = torch.arange(sk, device=device, dtype=torch.int64)
+    valid = (ks[None, :] >= doc_start[:, None]) & (ks[None, :] <= pos[:, None])
+    return torch.where(
+        valid,
+        torch.zeros((), dtype=torch.float32, device=device),
+        torch.full((), float("-inf"), dtype=torch.float32, device=device),
+    )
+
+
+def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale, causal_mask=None):
     """
     Unfused sparse attention implementation.
+
+    ``causal_mask`` overrides the default upper-triangular causal mask; pass a
+    ``[sq, skv]`` document-boundary mask (see :func:`_block_diag_causal_mask`) for THD.
     """
     sq, b, np, hn = query.size()
     skv = key.size(0)
@@ -1197,11 +1247,12 @@ def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
     # index_mask [b, sq, skv]
     index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
     index_mask.scatter_(-1, topk_indices, 0)
-    # causal_mask [sq, skv]
-    causal_mask = torch.triu(
-        torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=index_mask.device),
-        diagonal=1,
-    )
+    # causal_mask [sq, skv] — upper-triangular by default, document-boundary for THD.
+    if causal_mask is None:
+        causal_mask = torch.triu(
+            torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=index_mask.device),
+            diagonal=1,
+        )
     # [b, sq, skv] + [1, sq, skv] -> [b, sq, skv]
     index_mask += causal_mask.view(1, sq, skv)
     # [b, np, sq, skv] + [b, 1, sq, skv] -> [b, np, sq, skv]
@@ -1329,7 +1380,20 @@ class DSAttention(MegatronModule):
         qr = qr.detach()
 
         # Get a FP32 mask with -inf for masked positions.
-        if attn_mask_type is not None:
+        packed = (
+            packed_seq_params is not None
+            and getattr(packed_seq_params, "qkv_format", None) == "thd"
+        )
+        if packed:
+            # THD: document-boundary causal mask so attention never crosses a packed
+            # sequence boundary. Reused for the indexer loss and the sparse attention.
+            cu_seqlens_q = (
+                packed_seq_params.cu_seqlens_q_padded
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else packed_seq_params.cu_seqlens_q
+            )
+            float_mask = _block_diag_causal_mask(cu_seqlens_q, sq, skv, x.device)
+        elif attn_mask_type is not None:
             assert attn_mask_type == AttnMaskType.causal, 'Only causal mask is supported for now'
             # Generate upper triangular mask with -inf above diagonal, 0 elsewhere
             # torch.triu with diagonal=1 creates upper triangular matrix (excluding main diagonal)
@@ -1384,7 +1448,10 @@ class DSAttention(MegatronModule):
             # ===================================
             # Run sparse attention kernel
             # ===================================
-            output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            output = unfused_dsa_fn(
+                query, key, value, topk_indices, self.softmax_scale,
+                causal_mask=float_mask if packed else None,
+            )
 
             # Attach loss to output
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
@@ -1400,7 +1467,10 @@ class DSAttention(MegatronModule):
             # ===================================
             # Run sparse attention kernel
             # ===================================
-            output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            output = unfused_dsa_fn(
+                query, key, value, topk_indices, self.softmax_scale,
+                causal_mask=float_mask if packed else None,
+            )
 
         self.current_topk_indices = (
             topk_indices  # Store for potential use by next layer in share mode

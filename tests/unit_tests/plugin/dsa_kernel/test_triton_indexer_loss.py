@@ -567,3 +567,201 @@ class TestIndexerLossPerformance:
     @pytest.mark.parametrize("seqlen", [1024, 2048, 4096, 8192])
     def test_performance_forward_backward(self, seqlen, dsa_metrics):
         self._run_case(seqlen, backward=True, dsa_metrics=dsa_metrics)
+
+
+# ---------------------------------------------------------------------------
+# THD (packed variable-length) support
+# ---------------------------------------------------------------------------
+
+
+def _build_block_diag_mask(cu_seqlens, sq, device):
+    """Dense ``[sq, sq]`` block-diagonal causal mask from ``cu_seqlens``.
+
+    ``0`` on/below the diagonal *within* each document, ``-inf`` everywhere else
+    (above the diagonal and across documents). This is the dense equivalent of
+    the per-query ``[start, end)`` bounds the THD kernels use.
+    """
+    mask = torch.full((sq, sq), float("-inf"), dtype=torch.float32, device=device)
+    bounds = cu_seqlens.tolist()
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        if end > start:
+            n = end - start
+            mask[start:end, start:end] = torch.triu(
+                torch.full((n, n), float("-inf"), device=device), diagonal=1
+            )
+    return mask
+
+
+def _make_packed_inputs(
+    doc_seqlens, num_heads, head_dim, index_n_heads, index_head_dim,
+    dtype=torch.bfloat16, seed=42,
+):
+    """Packed (THD, ``b=1``) indexer + attention tensors plus ``cu_seqlens``."""
+    torch.manual_seed(seed)
+    sq = sum(doc_seqlens)
+    q = torch.randn(sq, 1, index_n_heads, index_head_dim, dtype=dtype, device="cuda")
+    k = torch.randn(sq, 1, index_head_dim, dtype=dtype, device="cuda")
+    weights = (
+        torch.randn(sq, 1, index_n_heads, dtype=dtype, device="cuda")
+        * (index_n_heads**-0.5)
+    )
+    query = torch.randn(sq, 1, num_heads, head_dim, dtype=dtype, device="cuda")
+    key = torch.randn(sq, 1, num_heads, head_dim, dtype=dtype, device="cuda")
+    cu = [0]
+    for length in doc_seqlens:
+        cu.append(cu[-1] + length)
+    cu_seqlens = torch.tensor(cu, dtype=torch.int32, device="cuda")
+    block_diag = _build_block_diag_mask(cu_seqlens, sq, q.device)
+    return q, k, weights, query, key, cu_seqlens, block_diag
+
+
+def _drop_inf(x: torch.Tensor) -> torch.Tensor:
+    """Replace non-finite entries with 0 so cosine similarity stays defined."""
+    return torch.where(torch.isfinite(x), x, torch.zeros_like(x))
+
+
+@requires_sm90
+class TestTHDSupport:
+    """THD (packed variable-length) bounds path vs the dense block-diagonal mask."""
+
+    @pytest.fixture(scope="class", autouse=True)
+    def setup_class_pg(self, request):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(42)
+        request.cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp"]
+        )
+        yield
+        Utils.destroy_model_parallel()
+
+    def test_cu_seqlens_to_bounds(self):
+        from megatron.plugin.dsa_kernel.triton_indexer_loss import cu_seqlens_to_bounds
+
+        cu = torch.tensor([0, 5, 13], dtype=torch.int32, device="cuda")
+        q_start, q_end = cu_seqlens_to_bounds(cu, 13, torch.device("cuda"))
+        assert q_start.dtype == torch.int32 and q_end.dtype == torch.int32
+        assert q_start.tolist() == [0, 0, 0, 0, 0, 5, 5, 5, 5, 5, 5, 5, 5]
+        assert q_end.tolist() == list(range(1, 14))
+
+    def test_bounds_with_empty_and_single_token_docs(self):
+        """A repeated cu_seqlens entry (empty doc) and length-1 docs are valid."""
+        from megatron.plugin.dsa_kernel.triton_indexer_loss import (
+            cu_seqlens_to_bounds,
+            fwd_indexer_loss_triton,
+        )
+
+        cu = torch.tensor([0, 1, 1, 5], dtype=torch.int32, device="cuda")  # doc 2 empty
+        q_start, q_end = cu_seqlens_to_bounds(cu, 5, torch.device("cuda"))
+        assert q_start.tolist() == [0, 1, 1, 1, 1]
+        assert q_end.tolist() == [1, 2, 3, 4, 5]
+
+        q, k, weights, query, key, _, _ = _make_packed_inputs([1, 0, 4], 4, 64, 4, 64)
+        _, loss, _ = fwd_indexer_loss_triton(
+            q, weights, k, query, key, 4, 64**-0.5, 1.0, None,
+            self.pg_collection, False, cu_seqlens=cu,
+        )
+        assert torch.isfinite(loss), "THD loss with empty/single-token docs is not finite"
+
+    @pytest.mark.parametrize("doc_seqlens", [[10, 5], [8, 10, 5], [1, 63]])
+    def test_index_score_bounds_matches_dense(self, doc_seqlens):
+        from megatron.plugin.dsa_kernel.triton_indexer_loss import (
+            cu_seqlens_to_bounds,
+            indexer_index_score,
+        )
+
+        q, k, weights, _, _, cu_seqlens, block_diag = _make_packed_inputs(
+            doc_seqlens, 8, 64, 8, 128
+        )
+        q_start, q_end = cu_seqlens_to_bounds(cu_seqlens, q.shape[0], q.device)
+        got = indexer_index_score(q, k, weights, q_start, q_end)
+        ref = indexer_index_score(q, k, weights) + block_diag
+        cos = _cos_sim(_drop_inf(got), _drop_inf(ref))
+        assert cos > 0.9999, f"index_score bounds vs dense cos_sim={cos}"
+
+    @pytest.mark.parametrize("doc_seqlens", [[10, 5], [8, 10, 5]])
+    def test_attn_head_sum_bounds_matches_dense(self, doc_seqlens):
+        from megatron.plugin.dsa_kernel.triton_indexer_loss import (
+            attn_head_sum,
+            cu_seqlens_to_bounds,
+        )
+
+        _, _, _, query, key, cu_seqlens, block_diag = _make_packed_inputs(
+            doc_seqlens, 8, 64, 8, 128
+        )
+        scale = 64**-0.5
+        q_start, q_end = cu_seqlens_to_bounds(cu_seqlens, query.shape[0], query.device)
+        got = attn_head_sum(query, key, scale, None, q_start, q_end)
+        ref = attn_head_sum(query, key, scale, block_diag)
+        cos = _cos_sim(got, ref)
+        rel = _rel_err(got, ref)
+        assert cos > 0.9999, f"head_sum bounds vs dense cos_sim={cos}"
+        assert rel < 1e-3, f"head_sum rel_err={rel}"
+
+    @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+    @pytest.mark.parametrize("doc_seqlens", [[10, 8, 5], [1, 40], [1, 0, 4]])
+    def test_forward_loss_matches_reference(
+        self, doc_seqlens, calculate_per_token_loss, dsa_metrics
+    ):
+        from megatron.plugin.dsa_kernel.triton_indexer_loss import fwd_indexer_loss_triton
+
+        q, k, weights, query, key, cu_seqlens, block_diag = _make_packed_inputs(
+            doc_seqlens, 8, 64, 8, 128
+        )
+        scale, topk = 64**-0.5, 16
+        _, loss_ref = fwd_fused_indexer_loss_naive(
+            q, weights, k, query, key, topk, scale, 1.0, block_diag,
+            False, self.pg_collection, calculate_per_token_loss,
+        )
+        _, loss_got, _ = fwd_indexer_loss_triton(
+            q, weights, k, query, key, topk, scale, 1.0, None,
+            self.pg_collection, calculate_per_token_loss, cu_seqlens=cu_seqlens,
+        )
+        rel = _rel_err(loss_got, loss_ref)
+        dsa_metrics.record_accuracy(
+            {"docs": str(doc_seqlens), "per_token": calculate_per_token_loss},
+            cos_sim=1.0 - rel,
+            max_diff=(loss_got - loss_ref).abs().item(),
+            target="thd_loss",
+        )
+        assert torch.isfinite(loss_got), "THD fused loss is not finite"
+        assert rel < 1e-3, (
+            f"THD loss mismatch: fused={loss_got.item()} ref={loss_ref.item()} rel={rel}"
+        )
+
+    @pytest.mark.parametrize("doc_seqlens", [[10, 8, 5], [1, 40]])
+    def test_backward_grads_match_reference(self, doc_seqlens, dsa_metrics):
+        from megatron.plugin.dsa_kernel.triton_indexer_loss import bwd_indexer_loss_triton
+
+        q, k, weights, query, key, cu_seqlens, block_diag = _make_packed_inputs(
+            doc_seqlens, 8, 64, 8, 128
+        )
+        scale, topk = 64**-0.5, 16
+        grad_loss = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+
+        topk_indices, _ = fwd_fused_indexer_loss_naive(
+            q, weights, k, query, key, topk, scale, 1.0, block_diag,
+            False, self.pg_collection, False,
+        )
+        ref = bwd_fused_indexer_loss_naive(
+            q, weights, k, query, key, topk_indices, scale, 1.0,
+            False, grad_loss, self.pg_collection,
+            causal_mask_override=block_diag, calculate_per_token_loss=False,
+        )
+        got = bwd_indexer_loss_triton(
+            q, weights, k, query, key, scale, 1.0, grad_loss,
+            self.pg_collection, None, False, cu_seqlens=cu_seqlens,
+        )
+        for name, g, r in zip(("grad_q", "grad_weights", "grad_k"), got, ref):
+            assert g.shape == r.shape, f"{name} shape {g.shape} != {r.shape}"
+            assert torch.isfinite(g.float()).all(), f"{name} has NaN/Inf"
+            cos = _cos_sim(g, r)
+            dsa_metrics.record_accuracy(
+                {"docs": str(doc_seqlens)},
+                cos_sim=cos,
+                max_diff=(g.float() - r.float()).abs().max().item(),
+                target=f"thd_{name}",
+            )
+            assert cos > 0.999, f"{name} cos_sim={cos}"
+
