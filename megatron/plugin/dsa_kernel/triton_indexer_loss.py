@@ -760,7 +760,7 @@ def fwd_indexer_loss_triton(
     index_score = indexer_index_score(q, k, weights)
     if mask is not None:
         index_score = index_score + mask
-    topk_indices = index_score.topk(min(topk, sq), dim=-1)[1]
+    topk_indices = index_score.topk(min(topk, sk), dim=-1)[1]
 
     row_valid, _ = _row_masks(attn_mask, b)
     head_sum = attn_head_sum(query, key, softmax_scale, attn_mask)

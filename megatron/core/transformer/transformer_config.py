@@ -2642,7 +2642,15 @@ class TransformerConfig(ModelParallelConfig):
             reason = "it implements only the dense indexer loss (dsa_indexer_use_sparse_loss=True)"
         else:
             try:
-                import triton  # noqa: F401
+                import triton
+
+                from packaging.version import Version as _Version
+
+                if _Version(triton.__version__) < _Version("3.0.0"):
+                    reason = (
+                        f"the installed Triton {triton.__version__} is below the "
+                        "required triton>=3.0"
+                    )
             except ImportError:
                 reason = "Triton is not installed (needs triton>=3.0)"
 
