@@ -1242,6 +1242,142 @@ def _block_diag_causal_mask(cu_seqlens, sq, sk, device):
     )
 
 
+def _causal_mask_for_positions(q_pos, sk, device, cu_seqlens=None):
+    """``[sq, sk]`` additive causal mask given each query's ABSOLUTE position ``q_pos`` ([sq]).
+
+    Generalises :func:`_block_diag_causal_mask` to queries whose global positions are not simply
+    ``arange(sq)`` — needed under Context Parallel where a rank's local (zigzag) queries map to
+    non-contiguous global positions. A key ``t`` is visible to query row ``j`` iff ``t <= q_pos[j]``
+    and (when ``cu_seqlens`` is given, THD) ``t`` is in the same document as ``q_pos[j]``.
+    """
+    ks = torch.arange(sk, device=device, dtype=torch.int64)
+    q_pos = q_pos.to(device=device, dtype=torch.int64)
+    valid = ks[None, :] <= q_pos[:, None]
+    if cu_seqlens is not None:
+        cs = cu_seqlens.to(device=device, dtype=torch.int64)
+        q_doc = torch.searchsorted(cs[1:], q_pos, right=True)
+        k_doc = torch.searchsorted(cs[1:], ks, right=True)
+        valid = valid & (q_doc[:, None] == k_doc[None, :])
+    return torch.where(
+        valid,
+        torch.zeros((), dtype=torch.float32, device=device),
+        torch.full((), float("-inf"), dtype=torch.float32, device=device),
+    )
+
+
+def _cp_query_global_positions(s_local, cp_size, cp_rank, device):
+    """Global positions of this CP rank's local (zigzag) queries: ``[s_local]`` int64.
+
+    Mirrors the ``get_batch_on_this_cp_rank`` split: the full sequence is cut into ``2*cp_size``
+    chunks of ``C = s_full/(2*cp_size)`` tokens and rank ``r`` holds ``chunk[r] ++ chunk[2cp-1-r]``.
+    """
+    c = s_local // 2
+    first = torch.arange(cp_rank * c, cp_rank * c + c, device=device, dtype=torch.int64)
+    second0 = (2 * cp_size - 1 - cp_rank) * c
+    second = torch.arange(second0, second0 + c, device=device, dtype=torch.int64)
+    return torch.cat([first, second])
+
+
+class _CPGatherFullSeq(torch.autograd.Function):
+    """Differentiable all-gather of a CP-sharded ``[s_local, ...]`` tensor to global order.
+
+    Forward: ``all_gather`` over CP and undo the zigzag split so every rank holds the full
+    ``[s_full, ...]`` sequence in global order (each rank ``r`` contributes ``chunk[r] ++
+    chunk[2cp-1-r]``). Backward is the transpose of that gather: the full-sequence grad is the
+    same on every rank only for that rank's own contribution, so we ``all_reduce`` (sum) the
+    grad across CP and slice out this rank's two zigzag chunks — i.e. a reduce-scatter, which
+    routes each key/value position's gradient back to its owning rank.
+    """
+
+    @staticmethod
+    def forward(ctx, t, cp_group):
+        cp_size = torch.distributed.get_world_size(cp_group)
+        ctx.cp_group = cp_group
+        ctx.cp_size = cp_size
+        ctx.cp_rank = torch.distributed.get_rank(cp_group)
+        if cp_size == 1:
+            return t
+        gathered = [torch.empty_like(t) for _ in range(cp_size)]
+        torch.distributed.all_gather(gathered, t.contiguous(), group=cp_group)
+        half = t.shape[0] // 2
+        n_chunks = 2 * cp_size
+        chunks = [None] * n_chunks
+        for r in range(cp_size):
+            chunks[r] = gathered[r][:half]
+            chunks[n_chunks - 1 - r] = gathered[r][half:]
+        return torch.cat(chunks, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        cp_size = ctx.cp_size
+        if cp_size == 1:
+            return grad_out, None
+        grad_out = grad_out.contiguous()
+        torch.distributed.all_reduce(grad_out, group=ctx.cp_group)  # sum contributions over CP
+        n_chunks = 2 * cp_size
+        chunks = list(grad_out.chunk(n_chunks, dim=0))
+        r = ctx.cp_rank
+        local_grad = torch.cat([chunks[r], chunks[n_chunks - 1 - r]], dim=0)
+        return local_grad, None
+
+
+def _cp_gather_full_seq(t, cp_group):
+    """All-gather a ``[s_local, ...]`` tensor over CP and undo the zigzag split -> ``[s_full, ...]``.
+
+    Thin differentiable wrapper around :class:`_CPGatherFullSeq`; safe to call in eval (backward
+    is simply never invoked) and in train (gradients reduce-scatter back to each rank's shard).
+    """
+    return _CPGatherFullSeq.apply(t, cp_group)
+
+
+class _CPGatherReorder(torch.autograd.Function):
+    """Differentiable all-gather + explicit reorder to global (packed) order.
+
+    Like :class:`_CPGatherFullSeq`, but the rank-by-rank gathered concatenation is restored to
+    global order by an explicit permutation ``reorder_idx`` (from ``dsa_layout``) rather than the
+    fixed zigzag reassembly — needed for THD-packed CP, where per-document sharding makes the
+    reorder data-dependent. Backward is the transpose: scatter the grad back to the gathered
+    layout, ``all_reduce`` (sum) across CP, and slice out this rank's contiguous local chunk.
+    """
+
+    @staticmethod
+    def forward(ctx, t, cp_group, reorder_idx):
+        cp_size = torch.distributed.get_world_size(cp_group)
+        ctx.cp_group = cp_group
+        ctx.cp_size = cp_size
+        ctx.cp_rank = torch.distributed.get_rank(cp_group)
+        ctx.local_len = t.shape[0]
+        ctx.save_for_backward(reorder_idx)
+        if cp_size == 1:
+            return t.index_select(0, reorder_idx)
+        gathered = [torch.empty_like(t) for _ in range(cp_size)]
+        torch.distributed.all_gather(gathered, t.contiguous(), group=cp_group)
+        gathered = torch.cat(gathered, dim=0)
+        return gathered.index_select(0, reorder_idx)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (reorder_idx,) = ctx.saved_tensors
+        grad_out = grad_out.contiguous()
+        # Invert the reorder permutation: grad for gathered[reorder_idx[i]] is grad_out[i].
+        grad_gathered = torch.zeros(
+            (ctx.local_len * ctx.cp_size, *grad_out.shape[1:]),
+            dtype=grad_out.dtype,
+            device=grad_out.device,
+        )
+        grad_gathered.index_copy_(0, reorder_idx, grad_out)
+        if ctx.cp_size == 1:
+            return grad_gathered, None, None
+        torch.distributed.all_reduce(grad_gathered, group=ctx.cp_group)  # sum over CP
+        s = ctx.cp_rank * ctx.local_len
+        return grad_gathered[s : s + ctx.local_len].contiguous(), None, None
+
+
+def _cp_gather_reorder(t, cp_group, reorder_idx):
+    """All-gather ``[s_local, ...]`` over CP and reorder to global packed order via ``reorder_idx``."""
+    return _CPGatherReorder.apply(t, cp_group, reorder_idx)
+
+
 def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale, causal_mask=None):
     """
     Unfused sparse attention implementation.
@@ -1351,6 +1487,7 @@ class DSAttention(MegatronModule):
                 k_channels if k_channels is not None else config.kv_channels
             )
         self.softmax_scale = softmax_scale
+        self.pg_collection = pg_collection
         # Fuse the sparse attention with the Triton kernel when enabled (SM90 + Triton,
         # validated in TransformerConfig). Falls back to unfused_dsa_fn otherwise.
         self.apply_dsa_kernel_fusion = getattr(config, "apply_dsa_kernel_fusion", False)
@@ -1404,6 +1541,59 @@ class DSAttention(MegatronModule):
         skv = key.size(0)
         hnv = value.size(3)
 
+        packed = (
+            packed_seq_params is not None
+            and getattr(packed_seq_params, "qkv_format", None) == "thd"
+        )
+
+        # Context Parallel (all-gather): queries stay local, K/V gathered to full sequence,
+        # attended with a global-position causal mask. Mirrors the official DSA-indexer CP.
+        cp_group = self.pg_collection.cp if self.pg_collection is not None else None
+        cp_size = torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+        cp_on = cp_size > 1
+        cp_mask = None
+        cp_kv_reorder = None
+        cp_cu_seqlens = None
+        if cp_on:
+            cp_rank = torch.distributed.get_rank(cp_group)
+            if packed:
+                # THD + CP: per-document zigzag sharding. Global packed query positions + the
+                # gathered-KV reorder come from dsa_layout; gather K/V and restore global packed
+                # order, then mask by global-position causal AND same-document.
+                from megatron.core.transformer.experimental_attention_variant import dsa_layout
+
+                cp_cu_seqlens, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
+                packed_global = sq * cp_size
+                cover_q = int(cp_cu_seqlens[-1].item()) == packed_global
+                cover_kv = int(cu_seqlens_kv[-1].item()) == packed_global
+                q_global_pos, cp_kv_reorder = (
+                    dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                        cu_seqlens_q=cp_cu_seqlens,
+                        cu_seqlens_kv=cu_seqlens_kv,
+                        cp_size=cp_size,
+                        cp_rank=cp_rank,
+                        device=query.device,
+                        local_output_size=sq,
+                        key_local_output_size=sq,
+                        global_output_size=packed_global,
+                        query_cu_seqlens_cover_output=cover_q,
+                        key_cu_seqlens_cover_output=cover_kv,
+                    )
+                )
+                q_global_pos = q_global_pos.contiguous()
+                key = _cp_gather_reorder(key, cp_group, cp_kv_reorder)
+                value = _cp_gather_reorder(value, cp_group, cp_kv_reorder)
+                skv = key.size(0)
+                cp_mask = _causal_mask_for_positions(
+                    q_global_pos, skv, query.device, cu_seqlens=cp_cu_seqlens
+                )
+            else:
+                key = _cp_gather_full_seq(key, cp_group)
+                value = _cp_gather_full_seq(value, cp_group)
+                skv = key.size(0)
+                q_global_pos = _cp_query_global_positions(sq, cp_size, cp_rank, query.device)
+                cp_mask = _causal_mask_for_positions(q_global_pos, skv, query.device)
+
         # Share mode: reuse previous layer's topk indices, skip indexer computation
         if self.indexer is None:
             assert prev_topk_indices is not None, (
@@ -1411,7 +1601,7 @@ class DSAttention(MegatronModule):
                 f"available. Ensure the preceding layer has indexer_type='full'."
             )
             output = self._run_dsa_attention(
-                query, key, value, prev_topk_indices, causal_mask=None
+                query, key, value, prev_topk_indices, causal_mask=cp_mask
             )
             self.current_topk_indices = (
                 prev_topk_indices  # Store for potential use by next layer in share mode
@@ -1423,11 +1613,10 @@ class DSAttention(MegatronModule):
         qr = qr.detach()
 
         # Get a FP32 mask with -inf for masked positions.
-        packed = (
-            packed_seq_params is not None
-            and getattr(packed_seq_params, "qkv_format", None) == "thd"
-        )
-        if packed:
+        if cp_on:
+            # Local queries vs full-sequence keys; global-position causal mask built above.
+            float_mask = cp_mask
+        elif packed:
             # THD: document-boundary causal mask so attention never crosses a packed
             # sequence boundary. Reused for the indexer loss and the sparse attention.
             cu_seqlens_q = (
@@ -1454,11 +1643,19 @@ class DSAttention(MegatronModule):
                 mask, float('-inf')
             )
 
+        # unfused_dsa_fn needs the explicit mask whenever it isn't the plain [sq, skv] triu.
+        attn_causal_mask = float_mask if (packed or cp_on) else None
+
         if self.training and torch.is_grad_enabled():
             # ===================================
             # Prepare inputs for indexer loss
             # ===================================
             q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+            if cp_on:
+                k = (
+                    _cp_gather_reorder(k, cp_group, cp_kv_reorder)
+                    if packed else _cp_gather_full_seq(k, cp_group)
+                )  # [skv_full, b, d]
             indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
 
             # ===================================
@@ -1480,19 +1677,33 @@ class DSAttention(MegatronModule):
                 self.config.calculate_per_token_loss,
                 self.use_fused_indexer_loss,  # FlagScale Add
             )
-            # Save indexer loss for logging
+            if cp_on:
+                # Recompute top-k over the full key length (the fused loss derives its count from
+                # the local query length, wrong under CP). Indices are non-differentiable.
+                with torch.no_grad():
+                    index_scores = _compute_index_scores(q, weights, k) + float_mask
+                    topk_indices = index_scores.topk(min(self.indexer.index_topk, skv), dim=-1)[1]
+            # Loss is computed over local queries and left unscaled in the forward (the optimizer
+            # averages grads over the DP-with-CP group, matching the main-loss convention); only the
+            # logged value needs a cross-CP collective — SUM for per-token loss, AVG for mean.
             if indexer_loss_coeff > 0:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
+                    reduce_group=(
+                        cp_group if cp_on and self.config.calculate_per_token_loss else None
+                    ),
+                    avg_group=(
+                        cp_group if cp_on and not self.config.calculate_per_token_loss else None
+                    ),
                 )
 
             # ===================================
             # Run sparse attention kernel
             # ===================================
             output = self._run_dsa_attention(
-                query, key, value, topk_indices, causal_mask=float_mask if packed else None
+                query, key, value, topk_indices, causal_mask=attn_causal_mask
             )
 
             # Attach loss to output
@@ -1502,15 +1713,24 @@ class DSAttention(MegatronModule):
             # ===================================
             # Get index scores and top-k indices
             # ===================================
-            _, topk_indices = self.indexer.forward_with_scores(
-                x, qr, mask=float_mask, packed_seq_params=packed_seq_params
-            )
+            if cp_on:
+                q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+                k = (
+                    _cp_gather_reorder(k, cp_group, cp_kv_reorder)
+                    if packed else _cp_gather_full_seq(k, cp_group)
+                )
+                index_scores = _compute_index_scores(q, weights, k) + float_mask
+                topk_indices = index_scores.topk(min(self.indexer.index_topk, skv), dim=-1)[1]
+            else:
+                _, topk_indices = self.indexer.forward_with_scores(
+                    x, qr, mask=float_mask, packed_seq_params=packed_seq_params
+                )
 
             # ===================================
             # Run sparse attention kernel
             # ===================================
             output = self._run_dsa_attention(
-                query, key, value, topk_indices, causal_mask=float_mask if packed else None
+                query, key, value, topk_indices, causal_mask=attn_causal_mask
             )
 
         self.current_topk_indices = (

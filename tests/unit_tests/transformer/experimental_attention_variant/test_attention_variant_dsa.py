@@ -1665,6 +1665,522 @@ class TestDSAttentionTensorParallel:
             Utils.destroy_model_parallel()
 
 
+class TestDSAttentionContextParallel:
+    """CP forward parity: full-seq output == cp-sharded output gathered back (eval).
+
+    Run on multiple GPUs, e.g.::
+
+        torchrun --nproc_per_node=8 -m pytest -q \
+            tests/unit_tests/transformer/experimental_attention_variant/test_attention_variant_dsa.py \
+            -k TestDSAttentionContextParallel
+    """
+
+    CP_SIZES = [2, 4, 8]
+
+    @staticmethod
+    def _config(cp_size):
+        tp = parallel_state.get_tensor_model_parallel_world_size()
+        return MLATransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=16,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=tp,
+            context_parallel_size=cp_size,
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=64,
+            rope_type='rope',
+            rotary_base=10000,
+            rotary_percent=1.0,
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=16,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=False,
+        )
+
+    @staticmethod
+    def _build(config):
+        from megatron.core.extensions.transformer_engine import TELinear, TENorm
+        from megatron.core.transformer.spec_utils import ModuleSpec
+
+        indexer_submodules = DSAIndexerSubmodules(
+            linear_wq_b=ModuleSpec(module=TELinear),
+            linear_wk=ModuleSpec(module=TELinear),
+            k_norm=ModuleSpec(module=TENorm),
+            linear_weights_proj=ModuleSpec(module=TELinear),
+        )
+        submodules = DSAttentionSubmodules(
+            indexer=ModuleSpec(module=DSAIndexer, submodules=indexer_submodules)
+        )
+        pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        return DSAttention(
+            config=config, submodules=submodules, layer_number=1,
+            attn_mask_type=AttnMaskType.causal, attention_type='self', pg_collection=pg,
+        ).cuda()
+
+    @staticmethod
+    def _shard_zigzag(t, cp_size, cp_rank):
+        """[s, ...] -> this rank's local zigzag chunk (matches get_batch_on_this_cp_rank)."""
+        chunks = list(t.chunk(2 * cp_size, dim=0))
+        return torch.cat([chunks[cp_rank], chunks[2 * cp_size - 1 - cp_rank]], dim=0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cp_output_matches_full(self):
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            _cp_gather_full_seq,
+        )
+
+        seq_len, b = 64, 1
+        num_heads, head_dim, hidden = 16, 16, 256
+
+        def make_inputs():
+            torch.manual_seed(2026)  # identical on every rank
+            return (
+                torch.randn(seq_len, b, num_heads, head_dim, dtype=torch.bfloat16).cuda(),
+                torch.randn(seq_len, b, num_heads, head_dim, dtype=torch.bfloat16).cuda(),
+                torch.randn(seq_len, b, num_heads, head_dim, dtype=torch.bfloat16).cuda(),
+                torch.randn(seq_len, b, hidden, dtype=torch.bfloat16).cuda(),
+                torch.randn(seq_len, b, 64, dtype=torch.bfloat16).cuda(),
+            )
+
+        # ---- CP=1 baseline (full sequence, eval) ----
+        # Weights must be identical on every rank (CP replicates weights across the CP group);
+        # broadcast from global rank 0 and load the exact same state_dict into every CP model
+        # below, so any mismatch reflects the CP compute path rather than unsynced random init.
+        Utils.initialize_model_parallel(1, 1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(123)
+        attn = self._build(self._config(1))
+        for p in attn.parameters():
+            torch.distributed.broadcast(p.data, src=0)
+        attn.eval()
+        baseline_state = {k: v.detach().cpu().clone() for k, v in attn.state_dict().items()}
+        q, k, v, x, qr = make_inputs()
+        with torch.no_grad():
+            out_full = attn(
+                query=q, key=k, value=v, x=x, qr=qr,
+                attention_mask=None, attn_mask_type=AttnMaskType.causal,
+            ).detach().clone()
+        Utils.destroy_model_parallel()
+
+        world = torch.distributed.get_world_size()
+        for cp_size in self.CP_SIZES:
+            if world % cp_size != 0 or world < cp_size:
+                continue
+            Utils.initialize_model_parallel(1, 1, context_parallel_size=cp_size)
+            model_parallel_cuda_manual_seed(123)
+            attn = self._build(self._config(cp_size))
+            attn.load_state_dict(baseline_state)  # identical weights to the baseline
+            attn.eval()
+            cp_group = attn.pg_collection.cp
+            cp_rank = torch.distributed.get_rank(cp_group)
+
+            q, k, v, x, qr = make_inputs()  # identical full inputs on all ranks
+            ql = self._shard_zigzag(q, cp_size, cp_rank)
+            kl = self._shard_zigzag(k, cp_size, cp_rank)
+            vl = self._shard_zigzag(v, cp_size, cp_rank)
+            xl = self._shard_zigzag(x, cp_size, cp_rank)
+            qrl = self._shard_zigzag(qr, cp_size, cp_rank)
+            with torch.no_grad():
+                out_local = attn(
+                    query=ql, key=kl, value=vl, x=xl, qr=qrl,
+                    attention_mask=None, attn_mask_type=AttnMaskType.causal,
+                )
+            out_gathered = _cp_gather_full_seq(out_local, cp_group)  # -> [seq_len, b, hidden]
+
+            cos = torch.nn.functional.cosine_similarity(
+                out_gathered.float().reshape(1, -1), out_full.float().reshape(1, -1)
+            ).item()
+            max_diff = (out_gathered.float() - out_full.float()).abs().max().item()
+            assert out_gathered.shape == out_full.shape
+            assert cos > 0.999, f"[cp={cp_size}] cos_sim={cos} max_diff={max_diff}"
+            assert torch.allclose(
+                out_gathered.float(), out_full.float(), rtol=1e-2, atol=2e-2
+            ), f"[cp={cp_size}] max_diff={max_diff}"
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cp_train_loss_and_grads_match_full(self):
+        """Train-mode parity: indexer loss + gradients match the CP=1 baseline.
+
+        Validates Step 2: the differentiable CP gather (reduce-scatter backward for the main
+        attention key/value and the indexer key) and the cross-CP loss reduction (mean-path
+        ``/cp`` divisor + CP-sum logging). Compares, against a full-sequence CP=1 baseline:
+          * the (CP-summed) indexer loss value,
+          * grad wrt the attention ``key`` (gathered back to full order),
+          * grad wrt every indexer parameter (CP-summed) — the indexer params only receive
+            gradient through the loss path, so this isolates the loss CP correctness.
+        """
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossLoggingHelper,
+            _cp_gather_full_seq,
+        )
+
+        seq_len, b = 64, 1
+        num_heads, head_dim, hidden = 16, 16, 256
+
+        def make_inputs(requires_grad):
+            torch.manual_seed(2026)  # identical on every rank
+            mk = lambda *s: torch.randn(*s, dtype=torch.bfloat16).cuda()
+            q = mk(seq_len, b, num_heads, head_dim)
+            k = mk(seq_len, b, num_heads, head_dim)
+            v = mk(seq_len, b, num_heads, head_dim)
+            x = mk(seq_len, b, hidden)
+            qr = mk(seq_len, b, 64)
+            if requires_grad:
+                for t in (q, k, v):
+                    t.requires_grad_(True)
+            return q, k, v, x, qr
+
+        def read_loss():
+            vals = DSAIndexerLossLoggingHelper.tracker.get("values")
+            return None if vals is None else vals.sum().item()
+
+        def clear_loss():
+            if "values" in DSAIndexerLossLoggingHelper.tracker:
+                DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+
+        # ---- CP=1 baseline (full sequence, train) on every rank with identical weights ----
+        Utils.initialize_model_parallel(1, 1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(123)
+        attn = self._build(self._config(1))
+        for p in attn.parameters():
+            torch.distributed.broadcast(p.data, src=0)
+        attn.train()
+        baseline_state = {k: v.detach().cpu().clone() for k, v in attn.state_dict().items()}
+        clear_loss()
+        q, k, v, x, qr = make_inputs(requires_grad=True)
+        out = attn(
+            query=q, key=k, value=v, x=x, qr=qr,
+            attention_mask=None, attn_mask_type=AttnMaskType.causal,
+        )
+        base_loss = read_loss()
+        out.float().sum().backward()
+        base_key_grad = k.grad.detach().float().clone()
+        base_param_grad = {
+            n: p.grad.detach().float().clone()
+            for n, p in attn.named_parameters()
+            if n.startswith("indexer.") and p.grad is not None
+        }
+        Utils.destroy_model_parallel()
+
+        world = torch.distributed.get_world_size()
+        for cp_size in self.CP_SIZES:
+            if world % cp_size != 0 or world < cp_size:
+                continue
+            Utils.initialize_model_parallel(1, 1, context_parallel_size=cp_size)
+            model_parallel_cuda_manual_seed(123)
+            attn = self._build(self._config(cp_size))
+            attn.load_state_dict(baseline_state)  # identical weights to the baseline
+            attn.train()
+            cp_group = attn.pg_collection.cp
+            cp_rank = torch.distributed.get_rank(cp_group)
+
+            clear_loss()
+            q, k, v, x, qr = make_inputs(requires_grad=False)
+            kl = self._shard_zigzag(k, cp_size, cp_rank).detach().requires_grad_(True)
+            ql = self._shard_zigzag(q, cp_size, cp_rank)
+            vl = self._shard_zigzag(v, cp_size, cp_rank)
+            xl = self._shard_zigzag(x, cp_size, cp_rank)
+            qrl = self._shard_zigzag(qr, cp_size, cp_rank)
+            out = attn(
+                query=ql, key=kl, value=vl, x=xl, qr=qrl,
+                attention_mask=None, attn_mask_type=AttnMaskType.causal,
+            )
+
+            # Loss (mean path, calculate_per_token_loss=False): the tracker AVGs across CP, so the
+            # per-rank local means average to the global mean. AVG (not SUM) is magnitude-correct.
+            loss_local = torch.tensor([read_loss()], device="cuda")
+            torch.distributed.all_reduce(
+                loss_local, group=cp_group, op=torch.distributed.ReduceOp.AVG
+            )
+            cp_loss = loss_local.item()
+            assert abs(cp_loss - base_loss) <= 1e-2 * abs(base_loss) + 1e-3, (
+                f"[cp={cp_size}] loss {cp_loss} vs baseline {base_loss}"
+            )
+
+            out.float().sum().backward()
+
+            # Attention key grad: gather local (reduce-scattered) grads back to full order.
+            key_grad_full = _cp_gather_full_seq(kl.grad.detach(), cp_group).float()
+            kcos = torch.nn.functional.cosine_similarity(
+                key_grad_full.reshape(1, -1), base_key_grad.reshape(1, -1)
+            ).item()
+            assert kcos > 0.99, f"[cp={cp_size}] key-grad cos={kcos}"
+
+            # Indexer param grads: only the loss path feeds them. The optimizer averages grads over
+            # the DP-with-CP group, so the CP-AVG of the per-rank grads must equal the CP=1 baseline
+            # (this mirrors the mean-path convention — the forward loss is left UNSCALED). Check
+            # BOTH direction (cosine) and MAGNITUDE (relative norm): cosine alone is scale-invariant
+            # and would miss a wrong CP divisor such as an extra /cp.
+            for n, p in attn.named_parameters():
+                if not n.startswith("indexer.") or n not in base_param_grad:
+                    continue
+                g = p.grad.detach().float().clone() if p.grad is not None else torch.zeros_like(p, dtype=torch.float32)
+                torch.distributed.all_reduce(g, group=cp_group, op=torch.distributed.ReduceOp.AVG)
+                ref = base_param_grad[n]
+                pcos = torch.nn.functional.cosine_similarity(
+                    g.reshape(1, -1), ref.reshape(1, -1)
+                ).item()
+                rel = (g - ref).norm().item() / (ref.norm().item() + 1e-8)
+                assert pcos > 0.99 and rel < 5e-2, (
+                    f"[cp={cp_size}] indexer param {n} grad cos={pcos} rel={rel}"
+                )
+
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cp_thd_output_matches_full(self):
+        """THD + CP forward parity: packed (multi-doc) output under CP == CP=1+THD baseline.
+
+        The sequence packs several documents (``cu_seqlens``); under CP each document is sharded
+        per-document zigzag (``build_packed_allgather_cp_local_positions``), the local outputs are
+        gathered back to global packed order and compared against the CP=1 packed baseline. This
+        exercises the packed-CP path: per-doc positions, gather+reorder, and the causal ∧
+        same-document mask (plus Megatron's CP-aware THD RoPE inside the indexer).
+        """
+        from megatron.core.packed_seq_params import PackedSeqParams
+        from megatron.core.transformer.experimental_attention_variant.dsa import _cp_gather_reorder
+        from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+            build_packed_allgather_cp_local_positions,
+            build_packed_allgather_cp_query_positions_and_key_reorder,
+        )
+
+        b = 1
+        doc_lens = [32, 16, 16]  # each divisible by 2*cp for cp in {2,4,8}; total = 64
+        seq_len = sum(doc_lens)
+        num_heads, head_dim, hidden = 16, 16, 256
+        cu = torch.tensor([0, *torch.tensor(doc_lens).cumsum(0).tolist()], dtype=torch.int32).cuda()
+
+        def make_inputs():
+            torch.manual_seed(2026)
+            return (
+                torch.randn(seq_len, b, num_heads, head_dim, dtype=torch.bfloat16).cuda(),
+                torch.randn(seq_len, b, num_heads, head_dim, dtype=torch.bfloat16).cuda(),
+                torch.randn(seq_len, b, num_heads, head_dim, dtype=torch.bfloat16).cuda(),
+                torch.randn(seq_len, b, hidden, dtype=torch.bfloat16).cuda(),
+                torch.randn(seq_len, b, 64, dtype=torch.bfloat16).cuda(),
+            )
+
+        def packed_params():
+            return PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu,
+                cu_seqlens_kv=cu,
+                cu_seqlens_q_padded=cu,
+                cu_seqlens_kv_padded=cu,
+                max_seqlen_q=max(doc_lens),
+                max_seqlen_kv=max(doc_lens),
+            )
+
+        # ---- CP=1 baseline (full packed sequence, eval) ----
+        Utils.initialize_model_parallel(1, 1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(123)
+        attn = self._build(self._config(1))
+        for p in attn.parameters():
+            torch.distributed.broadcast(p.data, src=0)
+        attn.eval()
+        baseline_state = {k: v.detach().cpu().clone() for k, v in attn.state_dict().items()}
+        q, k, v, x, qr = make_inputs()
+        with torch.no_grad():
+            out_full = attn(
+                query=q, key=k, value=v, x=x, qr=qr,
+                attention_mask=None, attn_mask_type=AttnMaskType.causal,
+                packed_seq_params=packed_params(),
+            ).detach().clone()
+        Utils.destroy_model_parallel()
+
+        world = torch.distributed.get_world_size()
+        for cp_size in self.CP_SIZES:
+            if world % cp_size != 0 or world < cp_size:
+                continue
+            Utils.initialize_model_parallel(1, 1, context_parallel_size=cp_size)
+            model_parallel_cuda_manual_seed(123)
+            attn = self._build(self._config(cp_size))
+            attn.load_state_dict(baseline_state)
+            attn.eval()
+            cp_group = attn.pg_collection.cp
+            cp_rank = torch.distributed.get_rank(cp_group)
+
+            local = seq_len // cp_size
+            pos = build_packed_allgather_cp_local_positions(
+                cu, cp_size, cp_rank, torch.device("cuda"),
+                output_size=local, cu_seqlens_cover_output=True,
+            )
+            _, reorder = build_packed_allgather_cp_query_positions_and_key_reorder(
+                cu, cu, cp_size, cp_rank, torch.device("cuda"),
+                local_output_size=local, key_local_output_size=local,
+                global_output_size=seq_len,
+                query_cu_seqlens_cover_output=True, key_cu_seqlens_cover_output=True,
+            )
+
+            q, k, v, x, qr = make_inputs()  # identical full inputs on all ranks
+            sel = lambda t: t.index_select(0, pos)
+            with torch.no_grad():
+                out_local = attn(
+                    query=sel(q), key=sel(k), value=sel(v), x=sel(x), qr=sel(qr),
+                    attention_mask=None, attn_mask_type=AttnMaskType.causal,
+                    packed_seq_params=packed_params(),
+                )
+            out_gathered = _cp_gather_reorder(out_local, cp_group, reorder)  # -> global packed order
+
+            cos = torch.nn.functional.cosine_similarity(
+                out_gathered.float().reshape(1, -1), out_full.float().reshape(1, -1)
+            ).item()
+            max_diff = (out_gathered.float() - out_full.float()).abs().max().item()
+            assert out_gathered.shape == out_full.shape
+            assert cos > 0.999, f"[cp={cp_size}] thd cos_sim={cos} max_diff={max_diff}"
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cp_thd_train_loss_and_grads_match_full(self):
+        """THD + CP train parity: packed indexer loss + gradients match the CP=1+THD baseline.
+
+        Mirrors :meth:`test_cp_train_loss_and_grads_match_full` for packed (multi-document)
+        sequences under per-document zigzag CP sharding: compares the CP-summed indexer loss,
+        the gathered attention key grad, and the CP-averaged indexer param grads.
+        """
+        from megatron.core.packed_seq_params import PackedSeqParams
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossLoggingHelper,
+            _cp_gather_reorder,
+        )
+        from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+            build_packed_allgather_cp_local_positions,
+            build_packed_allgather_cp_query_positions_and_key_reorder,
+        )
+
+        b = 1
+        doc_lens = [32, 16, 16]
+        seq_len = sum(doc_lens)
+        num_heads, head_dim, hidden = 16, 16, 256
+        cu = torch.tensor([0, *torch.tensor(doc_lens).cumsum(0).tolist()], dtype=torch.int32).cuda()
+
+        def make_inputs():
+            torch.manual_seed(2026)
+            mk = lambda *s: torch.randn(*s, dtype=torch.bfloat16).cuda()
+            return (
+                mk(seq_len, b, num_heads, head_dim),
+                mk(seq_len, b, num_heads, head_dim),
+                mk(seq_len, b, num_heads, head_dim),
+                mk(seq_len, b, hidden),
+                mk(seq_len, b, 64),
+            )
+
+        def packed_params():
+            return PackedSeqParams(
+                qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                cu_seqlens_q_padded=cu, cu_seqlens_kv_padded=cu,
+                max_seqlen_q=max(doc_lens), max_seqlen_kv=max(doc_lens),
+            )
+
+        def read_loss():
+            vals = DSAIndexerLossLoggingHelper.tracker.get("values")
+            return None if vals is None else vals.sum().item()
+
+        def clear_loss():
+            if "values" in DSAIndexerLossLoggingHelper.tracker:
+                DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+
+        # ---- CP=1+THD baseline (train) on every rank with identical weights ----
+        Utils.initialize_model_parallel(1, 1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(123)
+        attn = self._build(self._config(1))
+        for p in attn.parameters():
+            torch.distributed.broadcast(p.data, src=0)
+        attn.train()
+        baseline_state = {k: v.detach().cpu().clone() for k, v in attn.state_dict().items()}
+        clear_loss()
+        q, k, v, x, qr = make_inputs()
+        k = k.detach().requires_grad_(True)
+        out = attn(
+            query=q, key=k, value=v, x=x, qr=qr,
+            attention_mask=None, attn_mask_type=AttnMaskType.causal,
+            packed_seq_params=packed_params(),
+        )
+        base_loss = read_loss()
+        out.float().sum().backward()
+        base_key_grad = k.grad.detach().float().clone()
+        base_param_grad = {
+            n: p.grad.detach().float().clone()
+            for n, p in attn.named_parameters()
+            if n.startswith("indexer.") and p.grad is not None
+        }
+        Utils.destroy_model_parallel()
+
+        world = torch.distributed.get_world_size()
+        for cp_size in self.CP_SIZES:
+            if world % cp_size != 0 or world < cp_size:
+                continue
+            Utils.initialize_model_parallel(1, 1, context_parallel_size=cp_size)
+            model_parallel_cuda_manual_seed(123)
+            attn = self._build(self._config(cp_size))
+            attn.load_state_dict(baseline_state)
+            attn.train()
+            cp_group = attn.pg_collection.cp
+            cp_rank = torch.distributed.get_rank(cp_group)
+
+            local = seq_len // cp_size
+            pos = build_packed_allgather_cp_local_positions(
+                cu, cp_size, cp_rank, torch.device("cuda"),
+                output_size=local, cu_seqlens_cover_output=True,
+            )
+            _, reorder = build_packed_allgather_cp_query_positions_and_key_reorder(
+                cu, cu, cp_size, cp_rank, torch.device("cuda"),
+                local_output_size=local, key_local_output_size=local,
+                global_output_size=seq_len,
+                query_cu_seqlens_cover_output=True, key_cu_seqlens_cover_output=True,
+            )
+
+            clear_loss()
+            q, k, v, x, qr = make_inputs()
+            sel = lambda t: t.index_select(0, pos)
+            kl = sel(k).detach().requires_grad_(True)
+            out = attn(
+                query=sel(q), key=kl, value=sel(v), x=sel(x), qr=sel(qr),
+                attention_mask=None, attn_mask_type=AttnMaskType.causal,
+                packed_seq_params=packed_params(),
+            )
+
+            loss_local = torch.tensor([read_loss()], device="cuda")
+            torch.distributed.all_reduce(
+                loss_local, group=cp_group, op=torch.distributed.ReduceOp.AVG
+            )
+            cp_loss = loss_local.item()
+            assert abs(cp_loss - base_loss) <= 1e-2 * abs(base_loss) + 1e-3, (
+                f"[cp={cp_size}] thd loss {cp_loss} vs baseline {base_loss}"
+            )
+
+            out.float().sum().backward()
+
+            key_grad_full = _cp_gather_reorder(kl.grad.detach(), cp_group, reorder).float()
+            kcos = torch.nn.functional.cosine_similarity(
+                key_grad_full.reshape(1, -1), base_key_grad.reshape(1, -1)
+            ).item()
+            assert kcos > 0.99, f"[cp={cp_size}] thd key-grad cos={kcos}"
+
+            for n, p in attn.named_parameters():
+                if not n.startswith("indexer.") or n not in base_param_grad:
+                    continue
+                g = p.grad.detach().float().clone() if p.grad is not None else torch.zeros_like(p, dtype=torch.float32)
+                torch.distributed.all_reduce(g, group=cp_group, op=torch.distributed.ReduceOp.AVG)
+                ref = base_param_grad[n]
+                pcos = torch.nn.functional.cosine_similarity(
+                    g.reshape(1, -1), ref.reshape(1, -1)
+                ).item()
+                rel = (g - ref).norm().item() / (ref.norm().item() + 1e-8)
+                assert pcos > 0.99 and rel < 5e-2, (
+                    f"[cp={cp_size}] thd indexer param {n} grad cos={pcos} rel={rel}"
+                )
+
+            Utils.destroy_model_parallel()
+
+
 @pytest.mark.internal
 class TestDSAModuleSpecDispatch:
     """Tests for get_dsa_module_spec_for_backend and get_experimental_attention_variant_module_spec."""
