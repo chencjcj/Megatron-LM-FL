@@ -251,6 +251,30 @@ def _ensure_indexer_loss_kernels() -> bool:
     return True
 
 
+_fused_dsa_attention = None
+
+
+def _ensure_sparse_attention_kernel() -> bool:
+    """Lazily import the fused Triton sparse-attention forward kernel.
+
+    Returns True if usable. Like :func:`_ensure_indexer_loss_kernels`, an import
+    failure degrades to the unfused PyTorch path instead of raising.
+    """
+    global _fused_dsa_attention
+    if _fused_dsa_attention is not None:
+        return True
+    try:
+        from megatron.plugin.dsa_kernel.triton_sparse_attention import fused_dsa_attention
+    except ImportError:
+        logger.warning(
+            "apply_dsa_kernel_fusion is set but the Triton sparse-attention kernel "
+            "could not be imported; falling back to the unfused PyTorch path."
+        )
+        return False
+    _fused_dsa_attention = fused_dsa_attention
+    return True
+
+
 ##### FlagScale End #####
 
 
@@ -1327,6 +1351,23 @@ class DSAttention(MegatronModule):
                 k_channels if k_channels is not None else config.kv_channels
             )
         self.softmax_scale = softmax_scale
+        # Fuse the sparse attention with the Triton kernel when enabled (SM90 + Triton,
+        # validated in TransformerConfig). Falls back to unfused_dsa_fn otherwise.
+        self.apply_dsa_kernel_fusion = getattr(config, "apply_dsa_kernel_fusion", False)
+
+    def _run_dsa_attention(self, query, key, value, topk_indices, causal_mask):
+        """Sparse attention dispatch: fused Triton kernel if enabled+available, else unfused.
+
+        Both paths are numerically equivalent (see the parity unit tests); the fused
+        forward avoids materialising the dense ``[b, np, sq, skv]`` fp32 score matrix.
+        """
+        if self.apply_dsa_kernel_fusion and _ensure_sparse_attention_kernel():
+            return _fused_dsa_attention(
+                query, key, value, topk_indices, self.softmax_scale, causal_mask=causal_mask
+            )
+        return unfused_dsa_fn(
+            query, key, value, topk_indices, self.softmax_scale, causal_mask=causal_mask
+        )
 
     def forward(
         self,
@@ -1369,7 +1410,9 @@ class DSAttention(MegatronModule):
                 f"Layer {self.layer_number} has indexer_type='shared' but no prev_topk_indices "
                 f"available. Ensure the preceding layer has indexer_type='full'."
             )
-            output = unfused_dsa_fn(query, key, value, prev_topk_indices, self.softmax_scale)
+            output = self._run_dsa_attention(
+                query, key, value, prev_topk_indices, causal_mask=None
+            )
             self.current_topk_indices = (
                 prev_topk_indices  # Store for potential use by next layer in share mode
             )
@@ -1448,9 +1491,8 @@ class DSAttention(MegatronModule):
             # ===================================
             # Run sparse attention kernel
             # ===================================
-            output = unfused_dsa_fn(
-                query, key, value, topk_indices, self.softmax_scale,
-                causal_mask=float_mask if packed else None,
+            output = self._run_dsa_attention(
+                query, key, value, topk_indices, causal_mask=float_mask if packed else None
             )
 
             # Attach loss to output
@@ -1467,9 +1509,8 @@ class DSAttention(MegatronModule):
             # ===================================
             # Run sparse attention kernel
             # ===================================
-            output = unfused_dsa_fn(
-                query, key, value, topk_indices, self.softmax_scale,
-                causal_mask=float_mask if packed else None,
+            output = self._run_dsa_attention(
+                query, key, value, topk_indices, causal_mask=float_mask if packed else None
             )
 
         self.current_topk_indices = (

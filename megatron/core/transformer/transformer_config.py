@@ -423,8 +423,10 @@ class TransformerConfig(ModelParallelConfig):
     ##### FlagScale Begin #####
     """If True, use fused DSA sparse-attention kernels. On SM100+ (Blackwell), uses FlashMLA
     forward + cuDNN DSA backward (requires ``flash_mla`` and ``nvidia-cudnn-frontend``).
-    On SM90 (Hopper), uses Triton-based fused kernels (requires ``triton>=3.0``).
-    When False, falls back to unfused PyTorch implementations."""
+    On SM90 (Hopper), the plain ``dsa`` variant uses a Triton flash-style sparse-attention
+    forward (``megatron.plugin.dsa_kernel.triton_sparse_attention``; requires ``triton>=3.0``)
+    that attends to only the top-k keys instead of the dense ``[b, np, sq, skv]`` fp32 score
+    matrix. When False, falls back to unfused PyTorch implementations."""
 
     apply_dsa_indexer_loss_fusion: bool = True
     """If True (default), compute the DSA indexer KL loss with fused Triton kernels that reduce over
