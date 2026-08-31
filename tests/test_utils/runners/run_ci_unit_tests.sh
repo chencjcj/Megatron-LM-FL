@@ -48,8 +48,8 @@ selected = []
 for item in shlex.split(os.environ["CI_TEST_PATH"]):
     matches = sorted(glob.glob(item)) if glob.has_magic(item) else [item]
     selected.extend(path for path in matches if path not in ignored_files)
-print("\n".join(selected))
-'
+print("\n".join(selected), file=os.fdopen(3, "w"))
+' 3>&1 1>&2
 )
 
 IGNORE_OPTS=()
@@ -60,10 +60,11 @@ done < <(
 import json
 import os
 
+output = os.fdopen(3, "w")
 for item in json.loads(os.environ["CI_IGNORED_TESTS"]):
     prefix = "--deselect=" if "::" in item else "--ignore="
-    print(prefix + item)
-'
+    print(prefix + item, file=output)
+' 3>&1 1>&2
 )
 
 EXTRA_ARGS=()
@@ -74,8 +75,8 @@ done < <(
 import json
 import os
 
-print("\n".join(json.loads(os.environ["CI_PYTEST_EXTRA_ARGS"])))
-'
+print("\n".join(json.loads(os.environ["CI_PYTEST_EXTRA_ARGS"])), file=os.fdopen(3, "w"))
+' 3>&1 1>&2
 )
 
 if [ "${#TEST_PATHS[@]}" -eq 0 ]; then
@@ -140,6 +141,7 @@ PYTEST_ARGS+=(
 
 set +e
 "$PYTHON_BIN" -m torch.distributed.run --nproc_per_node="$CI_NPROC_PER_NODE" \
+  --master_port="${MASTER_PORT:-29500}" \
   -m coverage run \
   --rcfile="$COVERAGE_DIR/.coveragerc" \
   "$PYTEST_BIN" \
