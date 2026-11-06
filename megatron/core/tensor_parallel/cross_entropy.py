@@ -1,5 +1,9 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+##### FlagScale Begin #####
+import os
+
+##### FlagScale End #####
 from typing import Tuple
 
 import torch
@@ -229,7 +233,33 @@ def vocab_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=
         label_smoothing: smoothing factor, must be in range [0.0, 1.0)
                          default is no smoothing (=0.0)
     """
+    ##### FlagScale Begin #####
+    # Opt-in fused Triton fast path: TRITON_CROSS_ENTROPY=1, TP=1, no label smoothing.
+    if _use_triton_cross_entropy(vocab_parallel_logits, label_smoothing):
+        from .triton_cross_entropy import triton_cross_entropy
+
+        return triton_cross_entropy(vocab_parallel_logits, target)
+    ##### FlagScale End #####
     return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, label_smoothing)
+
+
+##### FlagScale Begin #####
+def _use_triton_cross_entropy(vocab_parallel_logits, label_smoothing):
+    """Whether to use the fused Triton cross entropy kernels."""
+    if os.environ.get("TRITON_CROSS_ENTROPY", "0") != "1":
+        return False
+    if label_smoothing != 0 or vocab_parallel_logits.device.type == "cpu":
+        return False
+    if get_tensor_model_parallel_world_size() != 1:
+        return False
+    try:
+        import triton  # pylint: disable=unused-import
+    except ImportError:
+        return False
+    return True
+
+
+##### FlagScale End #####
 
 
 class _VocabParallelCrossEntropyChunked(torch.autograd.Function):

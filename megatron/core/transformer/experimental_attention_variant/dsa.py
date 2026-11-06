@@ -2,6 +2,7 @@
 
 import copy
 import math
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import List, Optional, Tuple, Union
@@ -34,6 +35,50 @@ except ImportError:
     hadamard_transform = None
 
 
+def _hadamard_transform_torch(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Pure-torch fast Walsh-Hadamard transform along the last dim.
+
+    FlagScale Modify: fallback for platforms (e.g. MUSA) where the CUDA-only
+    `fast_hadamard_transform` package is unavailable. Uses the natural (Sylvester)
+    ordering and `scale` semantics identical to the reference kernel, so results
+    match `hadamard_transform(x, scale=...)`. The last dim must be a power of two.
+    """
+    n = x.size(-1)
+    assert n & (n - 1) == 0, f"hadamard transform requires power-of-two last dim, got {n}"
+    return _HadamardTransformGemm.apply(x, scale)
+
+
+def _hadamard_gemm(x: torch.Tensor, scale: float) -> torch.Tensor:
+    # One fp32 GEMM with the (symmetric, +-1) Sylvester matrix instead of a log2(n)-stage
+    # butterfly of stack/add kernels. bf16 inputs and +-1 entries are exact in fp32 (also
+    # under TF32), so the result matches the fp32 butterfly after the cast back. `scale`
+    # is applied after the GEMM so its non-power-of-two rounding never reaches TF32.
+    out = torch.matmul(x.float(), _sylvester_hadamard_matrix(x.size(-1), x.device))
+    return (out * scale).to(x.dtype)
+
+
+class _HadamardTransformGemm(torch.autograd.Function):
+    """y = (x @ H) * scale. H is symmetric, so dL/dx = (dL/dy @ H) * scale, the same op."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return _hadamard_gemm(x, scale)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _hadamard_gemm(grad_output, ctx.scale), None
+
+
+@lru_cache(maxsize=8)
+def _sylvester_hadamard_matrix(n: int, device: torch.device) -> torch.Tensor:
+    """Return the cached ``[n, n]`` fp32 Sylvester-ordered Hadamard matrix (unnormalized)."""
+    h = torch.ones(1, 1, dtype=torch.float32, device=device)
+    while h.size(0) < n:
+        h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
+    return h
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply Hadamard rotation activation.
     Reference:
@@ -48,9 +93,12 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert (
         x.dtype == torch.bfloat16
     ), f"rotate_activation only support bf16 input, but got {x.dtype}"
-    assert hadamard_transform is not None, "fast_hadamard_transform is not installed."
     hidden_size = x.size(-1)
-    return hadamard_transform(x, scale=hidden_size**-0.5)
+    if hadamard_transform is not None:
+        return hadamard_transform(x, scale=hidden_size**-0.5)
+    # FlagScale Modify: fall back to the pure-torch implementation when the
+    # fast_hadamard_transform CUDA package is not available (e.g. on MUSA).
+    return _hadamard_transform_torch(x, scale=hidden_size**-0.5)
 
 
 class DSAIndexerLossLoggingHelper:
@@ -343,6 +391,10 @@ def compute_dsa_indexer_loss(
     # Sum attention scores across heads.
     # [batch, heads, seqlen_q, seqlen_k] -> [batch, seqlen_q, seqlen_k]
     attention_scores = attention_scores.sum(dim=1)
+    # FlagScale Modify: the MUSA middle-dim sum can return tiny negatives (~-1e-7) for
+    # all-zero (masked) columns, which makes log(target + eps) below NaN. Softmax sums
+    # are non-negative by construction, so clamping is exact on other platforms.
+    attention_scores = attention_scores.clamp_(min=0.0)
     if pg_collection.tp.size() > 1:
         # attention scores are scattered to TP ranks in head dimension.
         torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
@@ -492,7 +544,16 @@ def bwd_fused_indexer_loss_naive(
     calculate_per_token_loss=False,
 ):
     """Naive implementation of backward pass for indexer loss."""
-    index_scores = _compute_index_scores(q, weights, k)  # [B, Sq, Sk]
+    ##### FlagScale Begin #####
+    # Compute the per-head indexer scores once and reuse them both for index_scores
+    # (forward recompute) and for the ReLU / weights backward below, instead of running
+    # the [sq, b, h, sk] fp32 einsum twice.
+    # Same ops / order as _compute_index_scores, so index_scores is bit-identical to it.
+    # scores_after_relu [sq, b, h, sk]
+    scores_after_relu = torch.relu(torch.einsum('sbhd,tbd->sbht', q.float(), k.float()))
+    # [sq, b, h, sk] -> [sq, b, sk] -> [b, sq, sk]
+    index_scores = (scores_after_relu * weights.unsqueeze(-1)).sum(dim=2).transpose(0, 1)
+    ##### FlagScale End #####
 
     sq, b, np, hn = query.size()
     sk = key.size(0)
@@ -569,6 +630,8 @@ def bwd_fused_indexer_loss_naive(
 
     # Sum attention scores across heads: [b, np, sq, sk] -> [b, sq, sk]
     attention_scores_sum = attention_scores_softmax.sum(dim=1)
+    # FlagScale Modify: see compute_dsa_indexer_loss, MUSA head-sum can go slightly negative.
+    attention_scores_sum = attention_scores_sum.clamp_(min=0.0)
     # Free attention_scores_softmax
     del attention_scores_softmax
 
@@ -652,12 +715,11 @@ def bwd_fused_indexer_loss_naive(
     grad_weighted_scores = grad_index_scores.unsqueeze(2)  # [sq, b, 1, sk]
     del grad_index_scores
 
-    # Compute forward values needed for backward
-    scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())  # [sq, b, h, sk]
-    # Compute relu_mask before relu (saves memory vs keeping both scores and relu output)
-    relu_mask = scores > 0
-    scores_after_relu = torch.relu(scores)
-    del scores
+    ##### FlagScale Begin #####
+    # scores_after_relu was computed once at the top of this function (no second
+    # [sq, b, h, sk] einsum here). relu(x) > 0 <=> x > 0, so the mask is unchanged.
+    relu_mask = scores_after_relu > 0
+    ##### FlagScale End #####
 
     # Backward through multiplication by weights: index_scores_per_head * weights
     # ∂L/∂weights = grad * relu_scores (sum over sk)
@@ -753,6 +815,102 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
 
         # query and key are detached in forward, so return None for their gradients
         return grad_q, grad_weights, grad_k, None, None, None, None, None, None, None, None, None
+
+
+##### FlagScale Begin #####
+def _dsa_kl_loss_and_grad_unit(index_scores, query, key, softmax_scale, calculate_per_token_loss):
+    """KL(target || softmax(index_scores)) for the causal, dense-loss, TP=1 case, plus the
+    gradient of the *un-scaled* per-row KL sum w.r.t. index_scores ("grad unit").
+
+    Same ops and order as compute_dsa_indexer_loss / bwd_fused_indexer_loss_naive with the
+    standard causal mask (every row has >= 1 valid key, so the row-valid masking is a no-op).
+    Computing the grad unit here lets backward skip re-running the [b, np, sq, sk] attention
+    and both softmaxes: d(loss)/d(index_scores) = grad_unit * grad_loss * coeff / divisor.
+    """
+    sq, b, np, hn = query.size()
+    sk = key.size(0)
+    q_ = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
+    k_ = key.permute(1, 2, 3, 0).reshape(b * np, hn, sk)
+    attention_scores = torch.bmm(q_.float(), k_.float()) * softmax_scale
+    attention_scores = attention_scores.reshape(b, np, sq, sk)
+    causal_mask = _cached_causal_neg_inf_mask(sq, sk, attention_scores.device)
+    attention_scores = attention_scores + causal_mask.view(1, 1, sq, sk)
+    attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
+    # MUSA head-sum can go slightly negative, see compute_dsa_indexer_loss.
+    target = attention_scores.sum(dim=1).clamp_(min=0.0)
+    target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+    # index_scores already holds -inf above the diagonal.
+    index_probs = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
+    kl_per_row = (target * (torch.log(target + 1e-10) - torch.log(index_probs + 1e-10))).sum(dim=-1)
+    kl_div = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
+    # d(sum_rows KL)/d(index_probs) = -target / (index_probs + eps); then softmax backward.
+    grad_probs = -target / (index_probs + 1e-10)
+    sum_grad = (grad_probs * index_probs).sum(dim=-1, keepdim=True)
+    grad_unit = index_probs * (grad_probs - sum_grad)
+    grad_unit = grad_unit * torch.tril(
+        torch.ones((sq, sk), device=index_scores.device, dtype=torch.bool)
+    ).float()
+    return kl_div, grad_unit
+
+
+if os.getenv("DSA_TORCH_COMPILE", "0") == "1":
+    _dsa_kl_loss_and_grad_unit = torch.compile(_dsa_kl_loss_and_grad_unit, dynamic=False)
+
+
+class FusedDSAIndexerLossTriton(torch.autograd.Function):
+    """FusedDSAIndexerLoss for the causal / dense-loss / TP=1 case using the Triton indexer
+    kernels (dsa_triton_indexer). Forward computes index scores without the [sq, b, h, sk]
+    fp32 intermediate, top-k, the KL loss and its index-score gradient direction; backward
+    only scales that direction and runs the fused indexer-score backward kernels."""
+
+    @staticmethod
+    def forward(ctx, q, weights, k, query, key, softmax_scale, topk, loss_coeff,
+                calculate_per_token_loss):
+        from megatron.core.transformer.experimental_attention_variant import (
+            dsa_triton_indexer,
+            dsa_triton_topk,
+        )
+
+        index_scores = dsa_triton_indexer.indexer_scores_fwd(q, weights, k)  # [b, sq, sk]
+        # Unordered index set (consumers only scatter it into masks); radix select instead
+        # of a full bitonic sort.
+        topk_indices = dsa_triton_topk.topk_indices(index_scores, min(topk, index_scores.size(-1)))
+        kl_div, grad_unit = _dsa_kl_loss_and_grad_unit(
+            index_scores, query, key, softmax_scale, calculate_per_token_loss
+        )
+        ctx.save_for_backward(q, weights, k, grad_unit)
+        ctx.loss_coeff = loss_coeff
+        ctx.calculate_per_token_loss = calculate_per_token_loss
+        return topk_indices, kl_div * loss_coeff
+
+    @staticmethod
+    def backward(ctx, grad_topk_indices, grad_loss):
+        from megatron.core.transformer.experimental_attention_variant import (
+            dsa_triton_indexer,
+        )
+
+        q, weights, k, grad_unit = ctx.saved_tensors
+        b, sq = grad_unit.shape[0], grad_unit.shape[1]
+        grad_kl_per_row = grad_loss * ctx.loss_coeff
+        if not ctx.calculate_per_token_loss:
+            grad_kl_per_row = grad_kl_per_row / (b * sq)
+        grad_index_scores = grad_unit * grad_kl_per_row
+        grad_q, grad_weights, grad_k = dsa_triton_indexer.indexer_scores_bwd(
+            q, weights, k, grad_index_scores
+        )
+        return grad_q, grad_weights, grad_k, None, None, None, None, None, None
+
+
+def _use_triton_indexer_loss(query, attn_mask_type, sparse_loss, pg_collection):
+    return (
+        os.getenv("DSA_TRITON_INDEXER", "0") == "1"
+        and attn_mask_type == AttnMaskType.causal
+        and not sparse_loss
+        and pg_collection.tp.size() == 1
+        and query.device.type != "cpu"
+        and query.size(0) > 0
+    )
+##### FlagScale End #####
 
 
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
@@ -936,12 +1094,32 @@ class DSAIndexer(MegatronModule):
 
         k_norm_config = copy.copy(self.config)
         k_norm_config.normalization = "LayerNorm"
-        self.k_norm = build_module(
-            submodules.k_norm,
-            config=k_norm_config,
-            hidden_size=self.index_head_dim,
-            eps=self.config.layernorm_epsilon,
-        )
+        # FlagScale Modify: the MUSA TransformerEngine port only implements RMSNorm;
+        # plain LayerNorm (used here for the DSA indexer k_norm) is an unimplemented
+        # stub (normalization.cpp layernorm_fwd) that crashes in allocateSpace. Fall
+        # back to torch-native LayerNorm on MUSA. k_norm operates on a "duplicated"
+        # (non-sequence-parallel) tensor, so SP must be disabled for the torch norm.
+        if cur_platform.device_name() == "musa":
+            from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+            # WrappedTorchNorm (plain torch.nn.LayerNorm) does not support any of the
+            # TE/apex fused-norm options, so disable them on this local config copy.
+            k_norm_config.sequence_parallel = False
+            k_norm_config.persist_layer_norm = False
+            k_norm_config.memory_efficient_layer_norm = False
+            k_norm_config.layernorm_zero_centered_gamma = False
+            self.k_norm = WrappedTorchNorm(
+                config=k_norm_config,
+                hidden_size=self.index_head_dim,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.k_norm = build_module(
+                submodules.k_norm,
+                config=k_norm_config,
+                hidden_size=self.index_head_dim,
+                eps=self.config.layernorm_epsilon,
+            )
 
         self.linear_weights_proj = build_module(
             submodules.linear_weights_proj,
@@ -1151,6 +1329,36 @@ def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
     return output
 
 
+##### FlagScale Begin #####
+_DSA_MASK_ATTR = "_dsa_triton_mask"
+
+
+def _dsa_sparse_attention(query, key, value, topk_indices, softmax_scale):
+    """Dispatch to the Triton sparse attention (dsa_triton_attn) when DSA_TRITON_ATTN=1 and
+    the shapes are supported, else to unfused_dsa_fn. The topk & causal mask is cached on the
+    topk_indices tensor so 'shared' layers reusing the same indices build it once."""
+    sq, b, np, hn = query.size()
+    skv, hnv = key.size(0), value.size(3)
+    if (
+        os.getenv("DSA_TRITON_ATTN", "0") != "1"
+        or query.device.type == "cpu"
+        or sq != skv
+        or sq % 128 != 0
+        or hn % 64 != 0
+        or hnv % 64 != 0
+        or (hnv & (hnv - 1)) != 0
+    ):
+        return unfused_dsa_fn(query, key, value, topk_indices, softmax_scale)
+    from megatron.core.transformer.experimental_attention_variant import dsa_triton_attn
+
+    mask = getattr(topk_indices, _DSA_MASK_ATTR, None)
+    if mask is None:
+        mask = dsa_triton_attn.build_dsa_mask(topk_indices, skv)
+        setattr(topk_indices, _DSA_MASK_ATTR, mask)
+    return dsa_triton_attn.sparse_attention(query, key, value, mask, softmax_scale)
+##### FlagScale End #####
+
+
 class DSAttention(MegatronModule):
     """
     This module implements sparse attention mechanism using an DSA Indexer to compute top-k
@@ -1285,7 +1493,7 @@ class DSAttention(MegatronModule):
                 f"Ensure its source layer runs earlier in the same pipeline stage."
             )
             topk_indices = topk_holder[self.source_layer]
-            output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            output = _dsa_sparse_attention(query, key, value, topk_indices, self.softmax_scale)
             return output
 
         # Detach x and qr to prevent gradients of indexer from flowing back to the main model.
@@ -1317,20 +1525,38 @@ class DSAttention(MegatronModule):
             # Attach indexer topk and loss
             # ===================================
             # Compute KL divergence loss between indexer scores and true attention scores
-            topk_indices, indexer_loss = FusedDSAIndexerLoss.apply(
-                q,
-                weights,
-                k,
-                query.detach(),
-                key.detach(),
-                self.softmax_scale,
-                self.indexer.index_topk,
-                indexer_loss_coeff,
-                float_mask,
-                getattr(self.config, "dsa_indexer_use_sparse_loss", False),
-                self.indexer.pg_collection,
-                self.config.calculate_per_token_loss,
-            )
+            sparse_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
+            ##### FlagScale Begin #####
+            if _use_triton_indexer_loss(
+                query, attn_mask_type, sparse_loss, self.indexer.pg_collection
+            ):
+                topk_indices, indexer_loss = FusedDSAIndexerLossTriton.apply(
+                    q,
+                    weights,
+                    k,
+                    query.detach(),
+                    key.detach(),
+                    self.softmax_scale,
+                    self.indexer.index_topk,
+                    indexer_loss_coeff,
+                    self.config.calculate_per_token_loss,
+                )
+            else:
+            ##### FlagScale End #####
+                topk_indices, indexer_loss = FusedDSAIndexerLoss.apply(
+                    q,
+                    weights,
+                    k,
+                    query.detach(),
+                    key.detach(),
+                    self.softmax_scale,
+                    self.indexer.index_topk,
+                    indexer_loss_coeff,
+                    float_mask,
+                    sparse_loss,
+                    self.indexer.pg_collection,
+                    self.config.calculate_per_token_loss,
+                )
             # Save indexer loss for logging
             if indexer_loss_coeff > 0:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
@@ -1342,7 +1568,7 @@ class DSAttention(MegatronModule):
             # ===================================
             # Run sparse attention kernel
             # ===================================
-            output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            output = _dsa_sparse_attention(query, key, value, topk_indices, self.softmax_scale)
 
             # Attach loss to output
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
@@ -1358,11 +1584,31 @@ class DSAttention(MegatronModule):
             # ===================================
             # Run sparse attention kernel
             # ===================================
-            output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            output = _dsa_sparse_attention(query, key, value, topk_indices, self.softmax_scale)
 
         # Publish this 'full' layer's top-k so subsequent 'shared' layers can reuse it.
         # detach() keeps the holder from pinning this layer's autograd graph alive.
         if topk_holder is not None:
-            topk_holder[self.layer_number] = topk_indices.detach()
+            published = topk_indices.detach()
+            ##### FlagScale Begin #####
+            # Carry the cached sparse-attention mask over to the detached alias.
+            if hasattr(topk_indices, _DSA_MASK_ATTR):
+                setattr(published, _DSA_MASK_ATTR, getattr(topk_indices, _DSA_MASK_ATTR))
+            ##### FlagScale End #####
+            topk_holder[self.layer_number] = published
 
         return output
+
+
+##### FlagScale Begin #####
+# Opt-in torch.compile of the naive DSA indexer / loss / sparse-attention functions.
+# Inductor fuses their fp32 elementwise + reduction chains (relu, weighting, masking,
+# softmax, KL) so the large [sq, b, h, sk] intermediates are not round-tripped through
+# memory. Matmuls stay on the aten kernels, so precision matches eager. Callers resolve
+# these names as module globals at call time, so rebinding here takes effect everywhere.
+if os.getenv("DSA_TORCH_COMPILE", "0") == "1":
+    _compute_index_scores = torch.compile(_compute_index_scores, dynamic=False)
+    compute_dsa_indexer_loss = torch.compile(compute_dsa_indexer_loss, dynamic=False)
+    bwd_fused_indexer_loss_naive = torch.compile(bwd_fused_indexer_loss_naive, dynamic=False)
+    unfused_dsa_fn = torch.compile(unfused_dsa_fn, dynamic=False)
+##### FlagScale End #####
