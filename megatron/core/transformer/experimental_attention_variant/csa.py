@@ -256,16 +256,17 @@ def unfused_compressed_sparse_attn(
     kv_t = kv_full.permute(1, 0, 2)
 
     safe_indices = topk_indices.clamp(min=0).long()  # [b, sq, topk]
-    safe_indices_exp = safe_indices.unsqueeze(-1).expand(-1, -1, -1, hn)  # [b, sq, topk, hn]
-    # [b, n_kv, hn] -> [b, 1, n_kv, hn] -> gather -> [b, sq, topk, hn]
-    kv_gathered = torch.gather(
-        kv_t.unsqueeze(1).expand(-1, sq, -1, -1), dim=2, index=safe_indices_exp
-    )
+    # Advanced indexing instead of gather over kv_t.expand(-1, sq, -1, -1): the gather backward
+    # materializes a dense [b, sq, n_kv, hn] grad (20 GiB at sq=4096, n_kv=5120, hn=512), while
+    # indexing backward is a scatter-add into [b, n_kv, hn]. Forward values are identical.
+    # Index the fp32 copy so the scatter-add accumulates in fp32: a bf16 scatter-add is ~5x less
+    # accurate than the old gather path, fp32 is slightly more accurate.
+    batch_idx = torch.arange(b, device=kv_t.device).view(b, 1, 1)
+    kv_g = kv_t.float()[batch_idx, safe_indices]  # [b, sq, topk, hn] fp32
 
     # --- Attention scores ---
     # query: [sq, b, np, hn] -> [b, np, sq, hn]
     q = query.permute(1, 2, 0, 3).float()
-    kv_g = kv_gathered.float()  # [b, sq, topk, hn]
 
     # [b, np, sq, topk]
     scores = torch.einsum("bnsh,bskh->bnsk", q, kv_g) * softmax_scale
